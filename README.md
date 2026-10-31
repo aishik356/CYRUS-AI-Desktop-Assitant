@@ -9,6 +9,10 @@
 A Windows desktop assistant with a cyber-style dashboard, local or online AI,
 typed chat, optional voice, system tools, timers, web search, and news.
 
+> [!IMPORTANT]
+> CYRUS is currently available for **Windows only**. Android, iOS, and macOS
+> versions are planned for future updates; they are not available yet.
+
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyQt6](https://img.shields.io/badge/UI-PyQt6-41CD52?logo=qt&logoColor=white)](https://www.riverbankcomputing.com/software/pyqt/)
