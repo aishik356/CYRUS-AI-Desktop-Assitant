@@ -1,0 +1,33 @@
+# Python environments and generated files
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+build/
+dist/
+.antigravityrules
+/test_jarvis.mp3
+
+# Local environment variables, credentials, and personal data
+.env
+.env.*
+!.env.example
+memory/*.json
+data/*.json
+
+# Per-user settings, API credentials, and assistant memory
+config/api_keys.json
+data/cyrus_memory.json
+
+# Downloaded model/runtime caches
+models/
+cache/
+audio_cache/
+audio/
+/en_GB-alan-medium.onnx
+/en_GB-alan-medium.onnx.json
+
+# Local voice assets
+voices/*.onnx
+voices/*.onnx.json

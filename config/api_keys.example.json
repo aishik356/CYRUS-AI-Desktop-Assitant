@@ -1,0 +1,6 @@
+{
+  "ai_backend": "ollama",
+  "openrouter_api_key": "",
+  "openrouter_chat_model": "openrouter/free",
+  "microphone_device_index": null
+}
