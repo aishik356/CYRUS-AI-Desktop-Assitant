@@ -2,12 +2,17 @@ import os
 import sys
 import math
 import time
+import getpass
+import tempfile
+import wave
 from datetime import datetime, timezone
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPoint, QRectF
+from pathlib import Path
+from array import array
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QPoint, QRectF
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QFileDialog, QDialog, QCheckBox, QComboBox,
     QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QMessageBox, QPushButton,
-    QSlider, QVBoxLayout, QFrame, QTextEdit, QLineEdit, QProgressBar,
+    QSlider, QVBoxLayout, QFrame, QTextEdit, QLineEdit, QProgressBar, QInputDialog,
     QGraphicsDropShadowEffect, QSizePolicy,
 )
 from PyQt6.QtGui import (
@@ -17,6 +22,7 @@ from PyQt6.QtGui import (
 
 from config.user_state import load_user_state, save_user_state
 from config.features import load_installed_features
+from config.settings import PROJECT_ROOT, get_user_data_dir
 
 try:
     import winsound
@@ -402,9 +408,11 @@ class DynamicIslandHUD(QWidget):
     """
     file_inspected_signal = pyqtSignal(str)
     mic_toggled_signal = pyqtSignal(bool)
+    mic_toggle_requested_signal = pyqtSignal()
     text_command_signal = pyqtSignal(str)
     stop_speech_signal = pyqtSignal()
     voice_output_status_signal = pyqtSignal(bool, bool)
+    shutdown_signal = pyqtSignal()
     voice_volume_changed_signal = pyqtSignal(int)
     system_volume_changed_signal = pyqtSignal(int)
     player_volume_changed_signal = pyqtSignal(int)
@@ -413,11 +421,14 @@ class DynamicIslandHUD(QWidget):
     music_state_signal = pyqtSignal(str, str, bool, bool)
     log_message_signal = pyqtSignal(str)
     _state_signal = pyqtSignal(str, str)
+    _offline_mode_requested_signal = pyqtSignal(bool)
     reminder_alert_signal = pyqtSignal(str)
     reminders_changed_signal = pyqtSignal(object)
     action_confirmation_signal = pyqtSignal(str)
     confirmed_action_signal = pyqtSignal(str)
     offline_mode_signal = pyqtSignal(bool)
+    microphone_input_status_signal = pyqtSignal(bool)
+    voice_output_initializing_signal = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
@@ -443,6 +454,8 @@ class DynamicIslandHUD(QWidget):
             0, min(100, int(self.user_preferences.get("player_volume", 100)))
         )
         self._reminder_alerts = []
+        self._alarm_audio_path = None
+        self._alarm_playing = False
         self._shutdown_confirmed = False
         self.current_state = ""
         self.current_subtext = ""
@@ -454,7 +467,17 @@ class DynamicIslandHUD(QWidget):
 
         # Connect thread-safe state updating slot
         self._state_signal.connect(self._apply_state)
+        self.mic_toggle_requested_signal.connect(
+            self.toggle_mic, Qt.ConnectionType.QueuedConnection
+        )
+        self._offline_mode_requested_signal.connect(self._apply_offline_mode)
         self.voice_output_status_signal.connect(self.set_voice_output_status)
+        self.voice_output_initializing_signal.connect(
+            self.set_voice_output_initializing
+        )
+        self.microphone_input_status_signal.connect(
+            self.set_microphone_input_enabled
+        )
 
         self.init_ui()
         self.voice_volume_save_timer = QTimer(self)
@@ -478,9 +501,13 @@ class DynamicIslandHUD(QWidget):
         self.countdown_timer.start(1000)
         self.alarm_timer = QTimer(self)
         self.alarm_timer.timeout.connect(self._play_alarm_sound)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self.cleanup_alarm_audio)
         self.update_mic_ui()
         voice_output_selected = load_installed_features()["alan_voice"]
-        self.set_voice_output_status(voice_output_selected, voice_output_selected)
+        self.set_voice_output_status(voice_output_selected, False)
+        self.set_voice_output_initializing(voice_output_selected)
         self.set_microphone_input_enabled(self.microphone_input_enabled)
         self.update_offline_indicator()
         self.apply_dashboard_customization()
@@ -1028,7 +1055,9 @@ class DynamicIslandHUD(QWidget):
             }
         """)
         self.log_terminal.append("[00:00:01] [SYS_INIT]: Cyrus Core v4.2 kernel initialized.")
-        self.log_terminal.append("[00:00:01] [AUDIO_ENGINE]: Local Piper speech ready.")
+        self.log_terminal.append(
+            "[00:00:01] [AUDIO_ENGINE]: Piper Alan initialization runs in background."
+        )
         self.log_terminal.append("[00:00:02] [HUD_SYNC]: Full window controls and chat bus online.")
         right_layout.addWidget(self.log_terminal, 2)
 
@@ -1350,7 +1379,10 @@ class DynamicIslandHUD(QWidget):
         """Updates mic buttons across dashboard and pill containers based on mute state."""
         if not self.is_mic_muted:
             self.btn_mic.setText("🎤 MIC ON")
-            self.btn_mic.setToolTip("Microphone Active - Click to Turn OFF (F3 / Ctrl+M)")
+            self.btn_mic.setToolTip(
+                "Microphone listening is enabled. Speak now, or click to turn it off "
+                "(F3 / Ctrl+M)."
+            )
             self.btn_mic.setStyleSheet("""
                 QPushButton {
                     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
@@ -1371,7 +1403,7 @@ class DynamicIslandHUD(QWidget):
                 }
             """)
             self.pill_btn_mic.setText("🎤")
-            self.pill_btn_mic.setToolTip("Microphone Active - Click to Mute")
+            self.pill_btn_mic.setToolTip("Microphone listening is enabled - Click to mute")
             self.pill_btn_mic.setStyleSheet("""
                 QPushButton {
                     background-color: rgba(0, 240, 255, 25);
@@ -1387,7 +1419,10 @@ class DynamicIslandHUD(QWidget):
             """)
         else:
             self.btn_mic.setText("🔇 MIC OFF")
-            self.btn_mic.setToolTip("Microphone Muted - Click to Turn ON (F3 / Ctrl+M)")
+            self.btn_mic.setToolTip(
+                "Microphone is off for privacy. Click to enable live speech input "
+                "(F3 / Ctrl+M). Typed chat works while muted."
+            )
             self.btn_mic.setStyleSheet("""
                 QPushButton {
                     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
@@ -1432,12 +1467,30 @@ class DynamicIslandHUD(QWidget):
             "padding: 3px 6px;"
         )
 
+    def set_offline_mode(self, enabled: bool):
+        """Thread-safe entrypoint for enabling offline mode after network errors."""
+        self._offline_mode_requested_signal.emit(bool(enabled))
+
+    def _apply_offline_mode(self, enabled: bool):
+        self.offline_mode = bool(enabled)
+        self.user_preferences["offline_mode"] = self.offline_mode
+        save_user_state(self.user_preferences)
+        self.update_offline_indicator()
+        self.offline_mode_signal.emit(self.offline_mode)
+        if self.offline_mode:
+            self.set_mic_muted(True)
+
     def open_settings_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("CYRUS Settings")
         dialog.setMinimumWidth(360)
         layout = QVBoxLayout(dialog)
         form = QFormLayout()
+
+        preferred_name = QLineEdit(
+            str(self.user_preferences.get("preferred_name", "")), dialog
+        )
+        form.addRow("Call me", preferred_name)
 
         panel_checks = {}
         panel_labels = {
@@ -1494,7 +1547,12 @@ class DynamicIslandHUD(QWidget):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
+
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if not preferred_name.text().strip():
+            QMessageBox.warning(self, "Settings", "Enter the name CYRUS should use for you.")
             return
 
         visible_panels = {key: check.isChecked() for key, check in panel_checks.items()}
@@ -1512,6 +1570,7 @@ class DynamicIslandHUD(QWidget):
                 "dashboard_scale": scale.currentData(),
                 "brightness": brightness.value(),
                 "offline_mode": offline.isChecked(),
+                "preferred_name": preferred_name.text().strip(),
             }
         )
         if not save_user_state(self.user_preferences):
@@ -1536,6 +1595,88 @@ class DynamicIslandHUD(QWidget):
                     "Network features and cloud speech recognition are disabled. "
                     "Use typed chat for commands while offline.",
                 )
+
+    def prompt_user_profile_if_needed(self) -> bool:
+        if self.user_preferences.get("profile_setup_complete"):
+            return True
+
+        while True:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Personalize CYRUS")
+            dialog.setMinimumWidth(360)
+            layout = QVBoxLayout(dialog)
+            form = QFormLayout()
+            name_input = QLineEdit(getpass.getuser(), dialog)
+            form.addRow("What should CYRUS call you?", name_input)
+            layout.addLayout(form)
+            buttons = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Save
+                | QDialogButtonBox.StandardButton.Cancel,
+                parent=dialog,
+            )
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+
+            preferred_name = name_input.text().strip()
+            if preferred_name:
+                break
+            QMessageBox.warning(
+                self,
+                "Personalize CYRUS",
+                "Enter the name CYRUS should use for you.",
+            )
+
+        self.user_preferences.update(
+            {
+                "preferred_name": preferred_name,
+
+                "profile_setup_complete": True,
+            }
+        )
+        if not save_user_state(self.user_preferences):
+            QMessageBox.critical(
+                self,
+                "Personalize CYRUS",
+                "Your profile could not be saved. Check local storage permissions.",
+            )
+            return False
+        return True
+
+    def prompt_microphone_permission(self) -> bool:
+        if not self.microphone_input_enabled:
+            return False
+        if self.offline_mode:
+            self.append_log(
+                "[MICROPHONE]: Offline mode is active; online speech recognition "
+                "is unavailable."
+            )
+            return False
+
+        result = QMessageBox.question(
+            self,
+            "Allow microphone access?",
+            "May CYRUS access your microphone for live voice commands? "
+            "Your microphone stays off unless you choose Yes. "
+            "Speech transcription uses the online recognition service.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if result == QMessageBox.StandardButton.Yes:
+            self.append_log(
+                "[MICROPHONE]: Permission granted for this session. "
+                "Opening the selected input device..."
+            )
+            self.set_mic_muted(False)
+            return True
+
+        self.append_log(
+            "[MICROPHONE]: Permission not granted. Typed chat remains available."
+        )
+        self.set_mic_muted(True)
+        return False
 
     def apply_dashboard_customization(self):
         panels = getattr(self, "dashboard_panels", {})
@@ -1598,15 +1739,71 @@ class DynamicIslandHUD(QWidget):
         self.alarm_timer.start(1200)
         alert.show()
 
+    def _ensure_alarm_audio_file(self) -> Path:
+        if self._alarm_audio_path and self._alarm_audio_path.is_file():
+            return self._alarm_audio_path
+
+        custom_audio_path = get_user_data_dir() / "reminder_alarm.wav"
+        if custom_audio_path.is_file():
+            return custom_audio_path
+
+        bundled_audio_path = PROJECT_ROOT / "assets" / "reminder_alarm.wav"
+        if bundled_audio_path.is_file():
+            return bundled_audio_path
+
+        audio_path = Path(tempfile.gettempdir()) / (
+            f"cyrus-reminder-alarm-{os.getpid()}.wav"
+        )
+        sample_rate = 22050
+        sample_count = sample_rate
+        samples = array("h")
+        for index in range(sample_count):
+            pulse = (index // (sample_rate // 5)) % 2 == 0
+            frequency = 1046 if (index // (sample_rate // 2)) % 2 == 0 else 1318
+            value = (
+                int(32767 * 0.72 * math.sin(2 * math.pi * frequency * index / sample_rate))
+                if pulse
+                else 0
+            )
+            samples.append(value)
+        with wave.open(str(audio_path), "wb") as audio_file:
+            audio_file.setnchannels(1)
+            audio_file.setsampwidth(2)
+            audio_file.setframerate(sample_rate)
+            audio_file.writeframes(samples.tobytes())
+        self._alarm_audio_path = audio_path
+        return audio_path
+
     def _play_alarm_sound(self):
         try:
             if winsound is not None:
-                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                if self._alarm_playing:
+                    return
+                audio_path = self._ensure_alarm_audio_file()
+                winsound.PlaySound(
+                    str(audio_path),
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP,
+                )
+                self._alarm_playing = True
             else:
                 QApplication.beep()
-        except RuntimeError as error:
+        except (OSError, RuntimeError) as error:
             print(f"[Reminder Alarm Warning]: Could not play alert sound: {error}")
             self.alarm_timer.stop()
+
+    def cleanup_alarm_audio(self):
+        if winsound is not None and self._alarm_playing:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except (RuntimeError, OSError) as error:
+                print(f"[Reminder Alarm Warning]: Could not stop alarm audio: {error}")
+        self._alarm_playing = False
+        if self._alarm_audio_path is not None:
+            try:
+                self._alarm_audio_path.unlink(missing_ok=True)
+            except OSError as error:
+                print(f"[Reminder Alarm Warning]: Could not remove temporary alarm: {error}")
+            self._alarm_audio_path = None
 
     def set_active_reminders(self, reminders):
         self._active_reminders = [
@@ -1621,6 +1818,7 @@ class DynamicIslandHUD(QWidget):
     def refresh_reminder_countdowns(self):
         now = datetime.now(timezone.utc)
         countdowns = []
+        nearest_countdown = None
         for reminder in getattr(self, "_active_reminders", []):
             try:
                 due_at = datetime.fromisoformat(reminder["due_at"])
@@ -1649,15 +1847,34 @@ class DynamicIslandHUD(QWidget):
                 name = "Timer" if kind == "timer" else "Reminder"
             label = name.upper() if kind == "reminder" else "TIMER"
             countdowns.append(f"{label}  •  {time_left}")
+            if nearest_countdown is None or remaining < nearest_countdown[0]:
+                nearest_countdown = (remaining, label)
 
         self.countdown_label.setText("\n".join(countdowns))
         self.countdown_panel.setVisible(bool(countdowns) and not self.is_pill_mode)
+        if self.is_pill_mode:
+            if nearest_countdown is not None:
+                remaining, label = nearest_countdown
+                minutes, seconds = divmod(remaining, 60)
+                self.pill_status_label.setText(
+                    f"● {label[:18]} {minutes:02}:{seconds:02}"
+                )
+            else:
+                self.pill_status_label.setText(
+                    f"● CYRUS {self.current_state or 'READY'}"
+                )
 
     def _forget_reminder_alert(self, alert):
         if alert in self._reminder_alerts:
             self._reminder_alerts.remove(alert)
         if not self._reminder_alerts:
             self.alarm_timer.stop()
+            if winsound is not None and self._alarm_playing:
+                try:
+                    winsound.PlaySound(None, winsound.SND_PURGE)
+                except (RuntimeError, OSError) as error:
+                    print(f"[Reminder Alarm Warning]: Could not stop alarm audio: {error}")
+                self._alarm_playing = False
 
     def _on_voice_volume_changed(self, volume: int):
         self.voice_volume = volume
@@ -1727,6 +1944,7 @@ class DynamicIslandHUD(QWidget):
         else:
             self.append_log(f"[ACTION]: Cancelled {action.replace('_', ' ')}.")
 
+    @pyqtSlot()
     def toggle_mic(self):
         """Toggles microphone mute state."""
         if not self.microphone_input_enabled:
@@ -1744,11 +1962,51 @@ class DynamicIslandHUD(QWidget):
             )
             self.set_mic_muted(True)
 
+    def prompt_ai_provider(self, portable: bool) -> str | None:
+        if portable:
+            return "openrouter"
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("CYRUS AI Provider")
+        dialog.setText("Choose the AI engine CYRUS should use.")
+        dialog.setInformativeText(
+            "Ollama runs locally. OpenRouter requires an API key and internet access."
+        )
+        ollama_button = dialog.addButton(
+            "Option A: Ollama (Local Engine)",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        openrouter_button = dialog.addButton(
+            "Option B: OpenRouter (Cloud API)",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(openrouter_button)
+        dialog.exec()
+        if dialog.clickedButton() is ollama_button:
+            return "ollama"
+        if dialog.clickedButton() is openrouter_button:
+            return "openrouter"
+        return None
+
+    def prompt_openrouter_api_key(self) -> str | None:
+        api_key, accepted = QInputDialog.getText(
+            self,
+            "OpenRouter API Key",
+            "Enter your OpenRouter API key:",
+            QLineEdit.EchoMode.Password,
+        )
+        return api_key.strip() if accepted and api_key.strip() else None
+
     def set_voice_output_status(self, selected: bool, available: bool):
         self.voice_volume_panel.setVisible(bool(selected))
         self.voice_volume_slider.setEnabled(bool(selected and available))
         self.voice_volume_value.setEnabled(bool(selected and available))
         self.voice_download_help.setVisible(bool(selected and not available))
+
+    def set_voice_output_initializing(self, selected: bool):
+        if selected:
+            self.voice_download_help.hide()
 
     def set_mic_muted(self, muted: bool):
         """Sets microphone mute state, emits signal, and refreshes UI feedback."""
@@ -1764,8 +2022,10 @@ class DynamicIslandHUD(QWidget):
             self.log_terminal.append(f"[{timestamp}] [AUDIO_IO]: Microphone MUTED - Input halted. (Use Chat Box below)")
             self.set_state("MUTED", "MIC OFF // CHAT READY")
         else:
-            self.log_terminal.append(f"[{timestamp}] [AUDIO_IO]: Microphone UNMUTED - Audio stream active.")
-            self.set_state("IDLE", "STANDBY")
+            self.log_terminal.append(
+                f"[{timestamp}] [AUDIO_IO]: Microphone enabled - waiting for speech."
+            )
+            self.set_state("LISTENING", "MIC ON // SPEAK NOW")
 
     def _create_volume_control(self, parent, label: str, initial_value: int, callback):
         layout = QHBoxLayout()
@@ -1958,6 +2218,8 @@ class DynamicIslandHUD(QWidget):
             self.log_terminal.append(f"[{timestamp}] [STATE]: {display_text}")
             scrollbar = self.log_terminal.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
+        if self.is_pill_mode:
+            self.refresh_reminder_countdowns()
 
     # Allow smooth dragging of the entire frameless window anywhere on screen
     def mousePressEvent(self, event):

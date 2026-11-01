@@ -1,16 +1,26 @@
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 
 project_root = Path(SPECPATH)
 
 datas = collect_data_files("piper", include_py_files=False)
+datas += [
+    (str(project_root / "voices" / asset_name), "voices")
+    for asset_name in (
+        "en_GB-alan-medium.onnx",
+        "en_GB-alan-medium.onnx.json",
+    )
+]
+datas.append((str(project_root / "assets" / "reminder_alarm.wav"), "assets"))
 binaries = []
 hiddenimports = [
     "piper.espeakbridge",
     "onnxruntime.capi.onnxruntime_pybind11_state",
+    "speech_recognition.recognizers.google",
 ]
+hiddenimports += collect_submodules("holidays.countries")
 excludes = [
     "speech_recognition.recognizers.whisper_local",
     "faster_whisper",

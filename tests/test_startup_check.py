@@ -141,6 +141,38 @@ class StartupCheckTests(unittest.TestCase):
         self.assertIn("OPENROUTER_API_KEY", ai_check.details)
         request.assert_not_called()
 
+    def test_portable_offline_mode_remains_openrouter_only(self):
+        features = {
+            "alan_voice": False,
+            "microphone_input": False,
+            "web_news": False,
+            "vlc_music": False,
+            "screen_analysis": False,
+        }
+        with (
+            patch("services.startup_check.PORTABLE_MODE", True),
+            patch("services.startup_check.load_installed_features", return_value=features),
+            patch(
+                "services.startup_check.load_api_settings",
+                return_value={"openrouter_api_key": "test-key"},
+            ),
+            patch.dict(
+                "os.environ",
+                {
+                    "CYRUS_AI_BACKEND": "ollama",
+                    "CYRUS_OFFLINE_MODE": "true",
+                },
+                clear=False,
+            ),
+            patch("services.startup_check.requests.get") as request,
+        ):
+            checks = check_startup_requirements()
+
+        self.assertTrue(checks[0].ready)
+        self.assertEqual(checks[0].name, "AI backend")
+        self.assertIn("OpenRouter", checks[0].details)
+        request.assert_not_called()
+
     def test_vlc_load_error_becomes_an_actionable_setup_warning(self):
         with (
             patch(

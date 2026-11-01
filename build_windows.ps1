@@ -18,8 +18,7 @@ if (!$compiler) {
 }
 
 $pythonCandidates = @(
-    (Join-Path $projectRoot ".venv\Scripts\python.exe"),
-    (Join-Path $projectRoot "venv\Scripts\python.exe")
+    (Join-Path $projectRoot ".venv\Scripts\python.exe")
 )
 $python = $pythonCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (!$python) {
@@ -42,7 +41,6 @@ try {
     Copy-Item "config\api_keys.example.json" $outputDirectory -Force
     Copy-Item "README.md" $outputDirectory -Force
     Copy-Item "download_ollama_model.ps1" $outputDirectory -Force
-    Copy-Item "download_alan_voice.ps1" $outputDirectory -Force
     New-Item -ItemType Directory -Path (Join-Path $projectRoot "dist\installer") -Force | Out-Null
 
     & $compiler ".\installer.iss" "/DBuildDir=$outputDirectory"
@@ -54,9 +52,10 @@ try {
         throw "Inno Setup completed without creating $installerPath."
     }
 
-    Write-Output "Portable CYRUS build created at $outputDirectory"
+    Remove-Item -LiteralPath $outputDirectory -Recurse -Force
+
     Write-Output "Windows installer created at $installerPath"
-    Write-Output "Keep the portable folder when sharing CYRUS; do not share personal .env or API key files."
+    Write-Output "The temporary runtime folder was removed; distribute the installer only."
 }
 finally {
     Pop-Location

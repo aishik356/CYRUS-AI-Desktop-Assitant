@@ -3,6 +3,7 @@ import time
 import os
 
 import speech_recognition as sr
+from speech_recognition.recognizers.google import recognize_legacy
 
 from config.settings import CONFIG_PATH, load_api_settings
 
@@ -15,6 +16,9 @@ class VoiceListener:
         self.is_offline = False
         self.microphone = None
         self._last_listen_error = None
+        self._last_transcription_error = None
+        self._microphone_init_failed = False
+        self.on_status_change = None
         
         # Audio detection thresholds
         self.recognizer.energy_threshold = 300
@@ -24,25 +28,22 @@ class VoiceListener:
         self.recognizer.non_speaking_duration = 0.3
         self.recognizer.operation_timeout = 8
 
-        device_index = self._configured_device_index()
-        try:
-            device_names = sr.Microphone.list_microphone_names()
-            if device_names:
-                print("[System] Microphone devices: " + "; ".join(
-                    f"{index}: {name}" for index, name in enumerate(device_names)
-                ))
-        except Exception as e:
-            print(f"[Microphone Warning]: Could not list input devices: {e}")
-
-        self.device_index = device_index
+        self.device_index = self._configured_device_index()
 
     def _initialize_microphone(self) -> bool:
         if self.microphone is not None:
             return True
+        if self._microphone_init_failed:
+            return False
         try:
             self.microphone = sr.Microphone(device_index=self.device_index)
         except Exception as error:
             print(f"[Microphone Init Error]: Could not open the microphone: {error}")
+            self._microphone_init_failed = True
+            self._report_status(
+                f"Microphone unavailable: {error}. Check Windows microphone "
+                "privacy permission and the selected input device."
+            )
             return False
         try:
             with self.microphone as source:
@@ -50,6 +51,7 @@ class VoiceListener:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
         except Exception as error:
             print(f"[Microphone Init Warning]: Could not calibrate the microphone: {error}")
+            self._report_status(f"Microphone calibration failed: {error}")
         return True
 
     @staticmethod
@@ -89,9 +91,20 @@ class VoiceListener:
             return None
         return device_index
 
+    def _report_status(self, message: str):
+        if self.on_status_change is not None:
+            self.on_status_change(message)
+
+    def _report_transcription_status(self, message: str):
+        if message != self._last_transcription_error:
+            self._report_status(message)
+            self._last_transcription_error = message
+
     def set_muted(self, muted: bool):
         """Enables or disables audio capture."""
         self.is_muted = muted
+        if not muted:
+            self._microphone_init_failed = False
         print(f"[System] VoiceListener mute status: {self.is_muted}")
 
     def set_offline_mode(self, enabled: bool):
@@ -134,34 +147,54 @@ class VoiceListener:
             if message != self._last_listen_error:
                 print(f"[Microphone Error]: Audio capture failed: {e}")
                 self._last_listen_error = message
+                if self.on_status_change is not None:
+                    self.on_status_change(f"Microphone capture failed: {e}")
             return None
 
     def transcribe(self, audio_data, timeout=None) -> str:
         """Transcribes speech using Google's online speech-recognition service."""
         if self.is_offline:
+            self._report_transcription_status(
+                "Speech recognition is disabled in offline mode; typed chat remains available."
+            )
             return ""
         if audio_data is None or self.is_muted:
             return ""
 
-        previous_timeout = self.recognizer.operation_timeout
+        recognizer = self.recognizer
+        previous_timeout = recognizer.operation_timeout
         if timeout is not None:
-            self.recognizer.operation_timeout = timeout
+            recognizer.operation_timeout = timeout
+        last_request_error = None
         try:
-            text = self.recognizer.recognize_google(audio_data, language="en-IN")
-            return text.strip()
-        except sr.UnknownValueError:
+            for language in ("en-IN", "en-US"):
+                try:
+                    text = recognize_legacy(
+                        recognizer, audio_data, language=language
+                    )
+                    self._last_transcription_error = None
+                    return text.strip()
+                except sr.UnknownValueError:
+                    continue
+                except sr.RequestError as error:
+                    last_request_error = error
+            if last_request_error is not None:
+                print(
+                    "[Speech Recognition Error]: Google's service is unavailable: "
+                    f"{last_request_error}"
+                )
+                self._report_transcription_status(
+                    "Online speech recognition is unavailable. Check your internet "
+                    "connection; microphone speech needs internet access."
+                )
+                return ""
+            self._report_transcription_status(
+                "Speech was not clear enough to transcribe. Try speaking closer to the microphone."
+            )
             return ""
-        except sr.RequestError:
-            try:
-                text = self.recognizer.recognize_google(audio_data, language="en-US")
-                return text.strip()
-            except sr.UnknownValueError:
-                return ""
-            except sr.RequestError as e:
-                print(f"[Speech Recognition Error]: Google's service is unavailable: {e}")
-                return ""
         except Exception as e:
             print(f"[Speech Recognition Error]: Transcription failed: {e}")
+            self._report_transcription_status(f"Speech transcription failed: {e}")
             return ""
         finally:
-            self.recognizer.operation_timeout = previous_timeout
+            recognizer.operation_timeout = previous_timeout

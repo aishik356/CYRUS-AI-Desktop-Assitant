@@ -19,6 +19,7 @@ data/*.json
 # Per-user settings, API credentials, and assistant memory
 config/api_keys.json
 data/cyrus_memory.json
+/config.json
 
 # Downloaded model/runtime caches
 models/

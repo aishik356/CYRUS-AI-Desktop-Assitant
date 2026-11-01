@@ -2,8 +2,9 @@ import unittest
 import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from services import system_tools
 from services.system_tools import CyrusPlayer, SystemTools
 
 
@@ -24,6 +25,12 @@ class SystemReportRoutingTests(unittest.TestCase):
                     handled, result = self.tools.system_controls(query)
                 self.assertTrue(handled)
                 self.assertEqual(result, expected)
+
+    def test_ambiguous_bare_system_specs_phrase_does_not_run_inventory_commands(self):
+        handled, result = self.tools.system_controls("system specifications")
+
+        self.assertTrue(handled)
+        self.assertIn("Did you want to check system specs", result)
 
     def test_general_health_and_ram_process_question_are_separate(self):
         with (
@@ -261,6 +268,72 @@ class VolumeRoutingTests(unittest.TestCase):
         self.assertEqual(result, "Music player volume set to 50 percent.")
         self.assertEqual(player.volume, 50)
         self.assertEqual(player.media_player.volume_calls, [50])
+
+    def test_music_search_errors_are_reported_to_the_dashboard(self):
+        class ImmediateThread:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        player = CyrusPlayer.__new__(CyrusPlayer)
+        player._lock = threading.RLock()
+        player._generation = 0
+        player._queue_generation = 0
+        player.queue = []
+        player.queue_index = -1
+        player.is_playing = False
+        player.is_paused = False
+        player.is_loading = False
+        player.current_title = ""
+        player.media_player = MagicMock()
+        player.on_state_change = MagicMock()
+        player.on_error = MagicMock()
+
+        with (
+            patch("services.system_tools.yt_dlp.YoutubeDL", side_effect=RuntimeError("network blocked")),
+            patch("services.system_tools.threading.Thread", ImmediateThread),
+        ):
+            result = player.play_song("test track")
+
+        self.assertEqual(result, "Finding test track.")
+        self.assertIn("Music search failed: network blocked", player.on_error.call_args.args[0])
+        self.assertEqual(player.on_state_change.call_args.args[1], "Could not load music")
+
+    def test_vlc_volume_is_applied_after_audio_output_starts(self):
+        class DelayedAudioPlayer:
+            def __init__(self):
+                self.state = system_tools.vlc.State.Opening
+                self.events = []
+
+            def play(self):
+                self.events.append("play")
+                return 0
+
+            def get_state(self):
+                if self.events.count("volume") > 0:
+                    self.state = system_tools.vlc.State.Playing
+                return self.state
+
+            def audio_set_volume(self, level):
+                self.events.append("volume")
+                self.asserted_level = level
+                return (
+                    0
+                    if self.state == system_tools.vlc.State.Playing
+                    else -1
+                )
+
+        player = CyrusPlayer.__new__(CyrusPlayer)
+        player.media_player = DelayedAudioPlayer()
+        player.volume = 73
+
+        with patch("services.system_tools.time.sleep"):
+            player._start_playback_with_volume()
+
+        self.assertEqual(player.media_player.events[0], "play")
+        self.assertEqual(player.media_player.asserted_level, 73)
 
     @patch("services.system_tools.AudioUtilities")
     def test_reads_current_system_master_volume_as_percentage(self, audio_utilities):

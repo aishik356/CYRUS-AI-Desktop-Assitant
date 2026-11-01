@@ -22,8 +22,13 @@ import vlc
 
 from memory.memory_manager import add_note, load_memory
 from config.features import load_installed_features
+from config.settings import load_api_settings, save_api_settings
 from config.user_state import load_user_state, save_user_state
-from services.reminder_service import ReminderService, parse_reminder_command
+from services.reminder_service import (
+    ReminderService,
+    parse_absolute_reminder_command,
+    parse_reminder_command,
+)
 
 try:
     import winreg
@@ -42,7 +47,109 @@ _COMMAND_TERMS = (
     "cpu", "disk", "computer", "live", "current", "utilization",
     "processor", "gpu", "graphics", "queue", "next", "previous",
     "song", "music", "player", "track", "play", "add", "volume",
+    "timer", "timers", "reminder", "reminders", "remind",
+    "second", "seconds", "minute", "minutes", "hour", "hours",
+    "sec", "secs", "min", "mins", "hr", "hrs",
+    "search", "google", "youtube", "spotify", "weather", "forecast",
+    "open", "cancel", "clear", "create", "start", "named", "called",
 )
+
+OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+DEFAULT_OPENROUTER_PAID_MODEL = "anthropic/claude-3.5-sonnet"
+DEFAULT_OPENROUTER_FREE_MODEL = "openrouter/free"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+
+
+def verify_openrouter_key(api_key: str, timeout: float = 10) -> str:
+    api_key = api_key.strip()
+    if not api_key:
+        raise ValueError("An OpenRouter API key is required.")
+
+    try:
+        response = requests.get(
+            OPENROUTER_KEY_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+    except requests.Timeout as error:
+        raise requests.Timeout("OpenRouter key verification timed out.") from error
+    except requests.ConnectionError as error:
+        raise requests.ConnectionError(
+            "Could not connect to OpenRouter to verify the API key."
+        ) from error
+    except requests.RequestException:
+        raise
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise ValueError("OpenRouter returned an invalid API key response.")
+    if not any(
+        field in data
+        for field in ("is_free_tier", "limit_remaining", "limit", "usage", "balance")
+    ):
+        raise ValueError("OpenRouter did not return API key credit information.")
+
+    free_tier = data.get("is_free_tier") is True
+    remaining = data.get("limit_remaining")
+    if remaining is not None:
+        free_tier = free_tier or float(remaining) <= 0
+    else:
+        balance = data.get("balance")
+        if balance is not None:
+            free_tier = free_tier or float(balance) <= 0
+        elif data.get("limit") is not None and data.get("usage") is not None:
+            free_tier = (
+                free_tier
+                or float(data["limit"]) - float(data["usage"]) <= 0
+            )
+    return "free" if free_tier else "paid"
+
+
+def configure_openrouter(api_key: str) -> dict:
+    tier = verify_openrouter_key(api_key)
+    settings = load_api_settings()
+    current_model = (
+        os.getenv("OPENROUTER_CHAT_MODEL", "").strip()
+        or str(settings.get("openrouter_chat_model", "")).strip()
+    )
+    if current_model == DEFAULT_OPENROUTER_FREE_MODEL:
+        current_model = ""
+    settings.update(
+        {
+            "ai_backend": "openrouter",
+            "openrouter_api_key": api_key.strip(),
+            "openrouter_key_tier": tier,
+            "openrouter_chat_model": (
+                DEFAULT_OPENROUTER_FREE_MODEL
+                if tier == "free"
+                else current_model or DEFAULT_OPENROUTER_PAID_MODEL
+            ),
+        }
+    )
+    save_api_settings(settings)
+    return settings
+
+
+def configure_ollama(host: str = DEFAULT_OLLAMA_HOST) -> dict:
+    host = host.strip().rstrip("/")
+    if not host:
+        raise ValueError("An Ollama host is required.")
+    try:
+        response = requests.get(host, timeout=3)
+        response.raise_for_status()
+    except requests.Timeout as error:
+        raise requests.Timeout(f"Ollama endpoint timed out: {host}") from error
+    except requests.ConnectionError as error:
+        raise requests.ConnectionError(
+            f"Could not connect to the Ollama endpoint: {host}"
+        ) from error
+    except requests.RequestException:
+        raise
+    settings = load_api_settings()
+    settings.update({"ai_backend": "ollama", "ollama_host": host})
+    save_api_settings(settings)
+    return settings
 
 
 def _correct_command_typos(query: str) -> str:
@@ -54,6 +161,9 @@ def _correct_command_typos(query: str) -> str:
             corrected.append(word)
             continue
         normalized = word.lower()
+        if normalized in _COMMAND_TERMS:
+            corrected.append(word)
+            continue
         match = difflib.get_close_matches(
             normalized, _COMMAND_TERMS, n=1, cutoff=0.76
         )
@@ -73,6 +183,7 @@ class CyrusPlayer:
         self.queue = []
         self.queue_index = -1
         self.on_state_change = None
+        self.on_error = None
         self._lock = threading.RLock()
         self._generation = 0
         self._queue_generation = 0
@@ -104,6 +215,9 @@ class CyrusPlayer:
                     "quiet": True,
                     "no_warnings": True,
                     "extract_flat": True,
+                    "socket_timeout": 15,
+                    "retries": 1,
+                    "extractor_retries": 1,
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     search = ydl.extract_info(
@@ -121,6 +235,7 @@ class CyrusPlayer:
                 self._play_queue_index(0)
             except Exception as e:
                 print(f"[Player Error]: {e}")
+                self._report_error(f"Music search failed: {e}")
                 with self._lock:
                     if queue_generation != self._queue_generation:
                         return
@@ -167,6 +282,9 @@ class CyrusPlayer:
         def _search_and_add():
             try:
                 options = {"quiet": True, "no_warnings": True, "extract_flat": True}
+                options.update(
+                    {"socket_timeout": 15, "retries": 1, "extractor_retries": 1}
+                )
                 with yt_dlp.YoutubeDL(options) as ydl:
                     search = ydl.extract_info(f"ytsearch5:{query}", download=False)
                 tracks = self._tracks_from_search(search, query)
@@ -188,6 +306,7 @@ class CyrusPlayer:
                 print(f"[Player]: Added {title} {'next' if play_next else 'to the queue'}.")
             except Exception as e:
                 print(f"[Player Error]: Could not add {query} to the queue: {e}")
+                self._report_error(f"Could not add {query} to the music queue: {e}")
                 self._notify("Could not add to queue", visible=True)
 
         threading.Thread(target=_search_and_add, daemon=True).start()
@@ -234,6 +353,30 @@ class CyrusPlayer:
         if callback:
             callback(self.current_title, status, visible, self.is_playing)
 
+    def _report_error(self, message: str):
+        callback = self.on_error
+        if callback is not None:
+            callback(message)
+
+    def _start_playback_with_volume(self):
+        if self.media_player.play() < 0:
+            raise RuntimeError("VLC could not start audio playback.")
+
+        deadline = time.monotonic() + 5
+        while True:
+            state = self.media_player.get_state()
+            if state == vlc.State.Error:
+                raise RuntimeError("VLC reported an audio playback error.")
+            if self.media_player.audio_set_volume(self.volume) >= 0:
+                return
+            if state == vlc.State.Playing:
+                raise RuntimeError("VLC could not set the player volume.")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "VLC did not initialize audio output before the timeout."
+                )
+            time.sleep(0.1)
+
     def _play_queue_index(self, index: int):
         with self._lock:
             if not self.queue:
@@ -262,6 +405,9 @@ class CyrusPlayer:
                     "format": "bestaudio/best",
                     "quiet": True,
                     "no_warnings": True,
+                    "socket_timeout": 15,
+                    "retries": 1,
+                    "extractor_retries": 1,
                 }
                 with yt_dlp.YoutubeDL(options) as ydl:
                     info = ydl.extract_info(track["url"], download=False)
@@ -273,9 +419,7 @@ class CyrusPlayer:
                     if generation != self._generation:
                         return
                     self.media_player.set_media(media)
-                    if self.media_player.audio_set_volume(self.volume) < 0:
-                        raise RuntimeError("VLC could not set the player volume.")
-                    self.media_player.play()
+                    self._start_playback_with_volume()
                     self.current_title = info.get("title") or track["title"]
                     self.is_loading = False
                     self.is_playing = True
@@ -283,6 +427,11 @@ class CyrusPlayer:
                 self._notify("Playing", visible=True)
             except Exception as e:
                 print(f"[Player Error]: Could not load {track['title']}: {e}")
+                self._report_error(f"Could not play {track['title']}: {e}")
+                try:
+                    self.media_player.stop()
+                except Exception as stop_error:
+                    print(f"[Player Error]: Could not stop failed playback: {stop_error}")
                 with self._lock:
                     if generation != self._generation:
                         return
@@ -407,6 +556,8 @@ class UnavailableCyrusPlayer:
 class SystemTools:
     def __init__(self):
         self.features = load_installed_features()
+        self.on_network_error = None
+        self.on_external_action_error = None
         if self.features["vlc_music"]:
             try:
                 self.player = CyrusPlayer()
@@ -423,7 +574,66 @@ class SystemTools:
         self.weather_favorites = state.get("weather_favorites", {})
         if not isinstance(self.weather_favorites, dict):
             self.weather_favorites = {}
-        self.reminders = ReminderService()
+        self.reminders = ReminderService(start=False)
+
+    def _report_network_error(self, error):
+        callback = self.on_network_error
+        if callback is not None:
+            callback(error)
+
+    def _report_external_action_error(self, message):
+        callback = getattr(self, "on_external_action_error", None)
+        if callback is not None:
+            callback(message)
+        else:
+            print(f"[Browser Action Error]: {message}")
+
+    def _play_youtube_search_result(self, search_term: str) -> None:
+        def find_and_open():
+            try:
+                options = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "extract_flat": "in_playlist",
+                    "noplaylist": True,
+                    "playlistend": 1,
+                    "socket_timeout": 10,
+                    "retries": 0,
+                    "extractor_retries": 0,
+                }
+                with yt_dlp.YoutubeDL(options) as downloader:
+                    result = downloader.extract_info(
+                        f"ytsearch1:{search_term}", download=False
+                    )
+                entries = result.get("entries") if isinstance(result, dict) else None
+                video = next((entry for entry in entries or [] if entry), None)
+                if not isinstance(video, dict):
+                    raise ValueError("YouTube returned no matching videos.")
+                video_url = video.get("webpage_url")
+                if not video_url and video.get("id"):
+                    video_url = (
+                        "https://www.youtube.com/watch?v="
+                        + urllib.parse.quote(str(video["id"]), safe="")
+                    )
+                if not video_url or not webbrowser.open(video_url):
+                    raise RuntimeError(
+                        "The video was found, but the default browser could not open it."
+                    )
+            except (
+                yt_dlp.utils.DownloadError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                self._report_external_action_error(
+                    f"Could not find or open a YouTube video: {error}"
+                )
+
+        threading.Thread(
+            target=find_and_open,
+            name="CyrusYouTubeSearch",
+            daemon=True,
+        ).start()
 
     def set_offline_mode(self, enabled: bool) -> None:
         self.is_offline = bool(enabled)
@@ -554,6 +764,9 @@ class SystemTools:
                 combined = " ".join(results)[:1800]
                 return f"Search results for {clean_query}: {combined}"
             return f"I couldn't find any relevant web search results for {clean_query}."
+        except requests.RequestException as e:
+            self._report_network_error(e)
+            return "The network endpoint is unreachable. CYRUS is switching to offline mode."
         except Exception as e:
             return f"Web search encountered an issue: {e}"
 
@@ -575,16 +788,32 @@ class SystemTools:
         try:
             if AudioUtilities is None:
                 return "System volume control is unavailable on this platform."
-            cmd = "nvidia-smi --query-gpu=name --format=csv,noheader"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
+            res = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             if res.returncode == 0 and res.stdout.strip():
                 return res.stdout.strip().split("\n")[0].strip()
         except Exception:
             pass
 
         try:
-            cmd = 'powershell -Command "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"'
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
+            res = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             if res.returncode == 0 and res.stdout.strip():
                 names = [line.strip() for line in res.stdout.strip().split("\n") if line.strip()]
                 dedicated = [g for g in names if "nvidia" in g.lower() or "rtx" in g.lower() or "radeon" in g.lower()]
@@ -598,8 +827,19 @@ class SystemTools:
     @staticmethod
     def get_cpu_temp() -> str:
         try:
-            cmd = 'powershell -Command "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi).CurrentTemperature"'
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
+            res = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi).CurrentTemperature",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             if res.returncode == 0 and res.stdout.strip():
                 raw = float(res.stdout.strip().split("\n")[0])
                 celsius = round((raw / 10.0) - 273.15, 1)
@@ -612,8 +852,17 @@ class SystemTools:
     @staticmethod
     def get_gpu_telemetry() -> tuple[str, str]:
         try:
-            cmd = "nvidia-smi --query-gpu=temperature.gpu,utilization.gpu --format=csv,noheader,nounits"
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=2)
+            res = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=temperature.gpu,utilization.gpu",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             if res.returncode == 0 and res.stdout.strip():
                 temp, util = [x.strip() for x in res.stdout.strip().split(",")]
                 return f"{temp}°C", f"{util}%"
@@ -635,6 +884,7 @@ class SystemTools:
                 text=True,
                 timeout=8,
                 check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             processors = json.loads(result.stdout)
             processors = processors if isinstance(processors, list) else [processors]
@@ -677,6 +927,7 @@ class SystemTools:
                 text=True,
                 timeout=3,
                 check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             memory_by_name = {}
             for line in result.stdout.splitlines():
@@ -700,6 +951,7 @@ class SystemTools:
                 text=True,
                 timeout=8,
                 check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             adapters = json.loads(result.stdout)
             adapters = adapters if isinstance(adapters, list) else [adapters]
@@ -754,6 +1006,7 @@ class SystemTools:
                 text=True,
                 timeout=8,
                 check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             modules = json.loads(result.stdout)
             modules = (
@@ -831,6 +1084,7 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
                 text=True,
                 timeout=20,
                 check=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             inventory = json.loads(result.stdout)
         except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
@@ -1281,6 +1535,8 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
             return summary
         except (requests.RequestException, KeyError, TypeError, ValueError) as e:
             print(f"[Weather Error]: {e}")
+            if isinstance(e, requests.RequestException):
+                self._report_network_error(e)
             return "I couldn't retrieve the live weather right now. Please check your internet connection and try again."
 
     # --- Local App Launcher ---
@@ -1392,8 +1648,9 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
 
     # --- System Controls Router ---
     def system_controls(self, query: str) -> tuple[bool, str]:
+        query = _correct_command_typos(query)
         timer_intent = re.search(
-            r"\b(?:timers?|reminders?|remind\s+me)\b|\bset\s+(?:a\s+)?time\b",
+            r"\b(?:timers?|reminders?|remind\s+me)\b",
             query,
             re.IGNORECASE,
         )
@@ -1407,8 +1664,10 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
                 reminders = self.reminders.list_reminders()
                 if not reminders:
                     return True, "You have no active timers or reminders."
-                return True, "Active reminders: " + "; ".join(
-                    f"{item['message']} (ID {item['id']})" for item in reminders
+                return True, "Active timers and reminders: " + "; ".join(
+                    f"{'Timer' if item.get('kind') == 'timer' else 'Reminder'}: "
+                    f"{item['message']} (ID {item['id']})"
+                    for item in reminders
                 )
             if re.search(
                 r"\b(?:cancel|delete|clear)\s+(?:(?:all|the|my)\s+)?(?:timers?|reminders?)\b",
@@ -1432,14 +1691,30 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
                 if not removed:
                     return True, "No matching active timer or reminder was found."
                 return True, f"Cancelled {removed} reminder{'s' if removed != 1 else ''}."
+            is_timer = bool(
+                re.search(r"\btimer\b", raw_query, re.IGNORECASE)
+                and not re.search(
+                    r"\b(?:reminder|remind\s+me)\b",
+                    raw_query,
+                    re.IGNORECASE,
+                )
+            )
+            try:
+                absolute = parse_absolute_reminder_command(raw_query)
+            except ValueError as error:
+                return True, str(error)
+            if absolute is not None:
+                due_at, message = absolute
+                return True, self.reminders.schedule_at(
+                    due_at,
+                    message,
+                    kind="timer" if is_timer else "reminder",
+                )
             parsed = parse_reminder_command(raw_query)
             if parsed:
-                kind = (
-                    "reminder"
-                    if re.search(r"\b(?:reminder|remind\s+me)\b", raw_query, re.IGNORECASE)
-                    else "timer"
+                return True, self.reminders.schedule(
+                    *parsed, kind="timer" if is_timer else "reminder"
                 )
-                return True, self.reminders.schedule(*parsed, kind=kind)
             return True, (
                 "I couldn't understand that timer duration. Try 'set a timer for "
                 "5 minutes' or 'remind me in 30 seconds to stretch'."
@@ -1448,10 +1723,69 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
         query = _correct_command_typos(query)
         q = query.replace(",", "").replace(".", "").replace("-", " ").strip().lower()
 
+        youtube_video_play = re.search(
+            r"\b(?:open|launch|go\s+to|search(?:\s+on)?)\s+youtube\b"
+            r".*?\bplay\s+(?P<query>.+)$"
+            r"|\bplay\s+(?P<query_direct>.+?)\s+(?:video|videos)\s+on\s+youtube\b",
+            query,
+            re.IGNORECASE,
+        )
+        if youtube_video_play:
+            search_term = next(
+                group.strip(" .,!?:;")
+                for group in youtube_video_play.groups()
+                if group
+            )
+            search_term = re.sub(r"^(?:a|the)\s+", "", search_term, flags=re.IGNORECASE)
+            search_term = re.sub(
+                r"\s+videos?$", "", search_term, flags=re.IGNORECASE
+            ).strip()
+            search_term = search_term or "random video"
+            if getattr(self, "is_offline", False):
+                return True, "Offline mode is enabled, so YouTube cannot be opened."
+            self._play_youtube_search_result(search_term)
+            return True, (
+                f"Finding a YouTube video for {search_term} and opening it "
+                "in your default browser."
+            )
+
+        spotify_play = re.search(
+            r"\b(?:open|launch|go\s+to)\s+spotify\b.*?\bplay\s+(?P<query>.+)$"
+            r"|\bplay\s+(?P<query_direct>.+?)\s+on\s+spotify\b",
+            query,
+            re.IGNORECASE,
+        )
+        if spotify_play:
+            search_term = next(
+                group.strip(" .,!?:;")
+                for group in spotify_play.groups()
+                if group
+            )
+            search_term = re.sub(r"^(?:a|the)\s+", "", search_term, flags=re.IGNORECASE)
+            if not search_term:
+                return True, "What song would you like to play on Spotify?"
+            if getattr(self, "is_offline", False):
+                return True, "Offline mode is enabled, so Spotify cannot be opened."
+            url = (
+                "https://open.spotify.com/search/"
+                + urllib.parse.quote(search_term, safe="")
+            )
+            if not webbrowser.open(url):
+                return True, (
+                    "I couldn't open Spotify. Check your internet connection "
+                    "and default browser."
+                )
+            return True, (
+                f"Opening Spotify results for {search_term}. Choose a result "
+                "to start playback."
+            )
+
         youtube_search = re.search(
             r"\b(?:open|launch|go to)\s+youtube\b.*?\bsearch(?:\s+for)?\s+(.+)$"
             r"|\bsearch\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$"
-            r"|\byoutube\s+(?:search|for)\s+(.+)$",
+            r"|\byoutube\s+(?:search|for)\s+(.+)$"
+            r"|\bsearch\s+for\s+(.+?)\s+on\s+youtube\b"
+            r"|\bsearch\s+(.+?)\s+on\s+youtube\b",
             query,
             re.IGNORECASE,
         )
@@ -1471,6 +1805,58 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
             if not webbrowser.open(url):
                 return True, "I couldn't open YouTube. Check your internet connection and try again."
             return True, f"Opening YouTube search results for {search_term}."
+
+        external_search = re.search(
+            r"\b(?:search|look\s+up)\s+(?:on\s+)?(?P<provider>google|spotify)"
+            r"\s+(?:for\s+)?(?P<query>.+)$"
+            r"|\b(?P<provider_first>google|spotify)\s+search\s+for\s+(?P<query_first>.+)$"
+            r"|\bsearch\s+for\s+(?P<query_last>.+?)\s+on\s+(?P<provider_last>google|spotify)\b"
+            r"|\bsearch\s+(?P<query_middle>.+?)\s+on\s+(?P<provider_middle>google|spotify)\b"
+            r"|\b(?:open|launch|go\s+to)\s+(?P<provider_open>google|spotify)"
+            r"\s+and\s+search\s+(?:for\s+)?(?P<query_open>.+)$",
+            query,
+            re.IGNORECASE,
+        )
+        if external_search:
+            provider = next(
+                external_search.group(name)
+                for name in (
+                    "provider", "provider_first", "provider_last",
+                    "provider_middle", "provider_open",
+                )
+                if external_search.group(name)
+            ).lower()
+            search_term = next(
+                external_search.group(name).strip(" .,!?:;")
+                for name in (
+                    "query", "query_first", "query_last",
+                    "query_middle", "query_open",
+                )
+                if external_search.group(name)
+            )
+            if not search_term:
+                return True, f"What would you like to search for on {provider.title()}?"
+            if getattr(self, "is_offline", False):
+                return True, (
+                    f"Offline mode is enabled, so {provider.title()} cannot be opened."
+                )
+            if provider == "google":
+                url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(
+                    search_term
+                )
+            else:
+                url = (
+                    "https://open.spotify.com/search/"
+                    + urllib.parse.quote(search_term, safe="")
+                )
+            if not webbrowser.open(url):
+                return True, (
+                    f"I couldn't open {provider.title()}. Check your internet "
+                    "connection and default browser."
+                )
+            return True, (
+                f"Opening {provider.title()} search results for {search_term}."
+            )
 
         favorite_list_request = bool(
             re.search(r"\b(?:list|show|what are)\s+(?:my\s+)?weather favorites\b", q)
@@ -1544,6 +1930,14 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
             re.search(r"\b(specs?|specifications?|hardware)\b", q)
             or "system information" in q
         )
+        if spec_request and not re.search(
+            r"\b(?:what|which|tell|show|get|list|describe|explain)\b|\bmy\b",
+            q,
+        ):
+            return True, (
+                "I may have misheard that. Did you want to check system specs, "
+                "or set a timer or reminder?"
+            )
         cpu_requested = bool(re.search(r"\b(cpu|processor)\b", q))
         gpu_requested = bool(re.search(r"\b(gpu|graphics card|graphics|video card)\b", q))
         ram_requested = bool(re.search(r"\b(ram|memory)\b", q))
@@ -1644,7 +2038,7 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
         if any(w in q for w in ["gpu spec", "gpu specs", "graphics card spec", "graphics spec", "what is my gpu"]):
             return True, self.get_gpu_spec()
 
-        if any(w in q for w in ["what is my spec", "what are my specs", "my specs", "pc specs", "full specs", "hardware specs", "system specs"]):
+        if any(w in q for w in ["what is my spec", "what are my specs", "my specs", "what are my pc specs", "full specs"]):
             return True, self.get_full_specs()
 
         # 5. Native Audio Controls

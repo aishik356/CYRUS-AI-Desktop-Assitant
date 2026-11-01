@@ -31,14 +31,27 @@ typed chat, optional voice, system tools, timers, web search, and news.
 > releases; it does not host the running assistant or provide a built-in
 > database of everything in the world.
 
+## CYRUS v1.1
+
+This release improves microphone transcription and safe mic toggling, adds
+common command typo correction, makes timer/reminder countdowns and alarms
+more reliable, and includes the custom reminder sound. It also improves
+personalized local-time greetings and YouTube search/play commands.
+
+**Only the Windows installer is provided.** The portable download is omitted
+because users reported inconsistent startup and microphone behavior with that
+package. The installer remains the supported distribution while those
+portable reliability issues are avoided.
+
 ## ✨ What it can do
 
 - **Chat your way:** use the dashboard chat box, with an optional manually
   enabled microphone. The microphone starts muted; there is no always-listening
-  wake word.
-- **Choose an AI backend:** run `llama3.2:3b` locally through Ollama, or
-  configure OpenRouter for online replies.
-- **Speak and listen:** use the optional local Piper Alan voice for speech
+  wake word. CYRUS uses context to interpret ordinary typing mistakes and
+  corrects common misspellings in supported command words.
+- **Choose an AI backend:** installed/source builds offer Ollama or OpenRouter
+  during first-run setup.
+- **Speak and listen:** use the bundled local Piper Alan voice for speech
   output and Google's online speech recognition for microphone input.
 - **Find information:** search the web and current news with DuckDuckGo. CYRUS
   returns a limited set of snippets and links, not exhaustive or guaranteed
@@ -47,13 +60,19 @@ typed chat, optional voice, system tools, timers, web search, and news.
   applications, adjust Windows and player volume, and use optional VLC music
   controls.
 - **Stay on schedule:** create timers and reminders with dashboard countdowns.
+  Reminders can use a duration or a calendar date/time; a date without a time
+  defaults to 9:00 AM local time.
+- **Personalize greetings:** set the name CYRUS uses for you; greetings use the
+  computer's current local time and public holidays for the automatically
+  detected system region.
 - **Customize the dashboard:** arrange its panels and adjust its appearance.
 
 ## 🚀 Download and install
 
 Open **[GitHub Releases](https://github.com/aishik356/CYRUS-AI-Desktop-Assitant/releases)**
-and download `CYRUS-Setup.exe` when a release is available. Run the installer
-to choose an install folder and optional features. No Python commands or
+and download `CYRUS-Setup.exe`. Version 1.1 provides the installer only; no
+portable application package is published. Run the installer to choose an
+install folder and optional features. No Python commands or
 `requirements.txt` installation are needed for the packaged app; the installer
 bundles CYRUS and its Python dependencies.
 
@@ -67,14 +86,15 @@ The setup lets you choose these optional features:
 
 | Feature | Notes |
 | --- | --- |
-| Alan voice output | Optional local voice download; review its upstream terms |
+| Alan voice output | Bundled local voice model; no separate download is needed; review its upstream terms |
 | Microphone input | Internet is required for Google's speech-recognition service; starts muted |
 | Web search and news | Internet required; uses DuckDuckGo |
 | VLC music controls | VLC must be installed separately |
 | Screen analysis | Requires an OpenRouter API key; screenshots are sent when analysis is requested |
 
 The local Ollama model `llama3.2:3b` is several gigabytes and is an optional,
-separate download. Alternatively, configure OpenRouter with your own API key.
+separate download. OpenRouter keys are verified during setup and stored in
+local configuration; free keys are restricted to free models.
 
 ## 🛠️ Run from source
 
@@ -82,7 +102,7 @@ separate download. Alternatively, configure OpenRouter with your own API key.
 
 - Windows 10/11, 64-bit
 - Python 3.11
-- Ollama running locally for the default AI backend, or an OpenRouter API key
+- Ollama running locally or an OpenRouter API key
 - VLC installed separately if you want music playback
 
 ### Install Python dependencies
@@ -105,21 +125,46 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ### Configure the AI backend
 
-For local AI, [install Ollama](https://ollama.com/download) and pull CYRUS's
-model:
+On first launch, choose Ollama or OpenRouter. For local AI, [install
+Ollama](https://ollama.com/download) and pull CYRUS's model:
 
 ```powershell
 ollama pull llama3.2:3b
 ```
 
-Keep Ollama running while using the local backend. To use OpenRouter instead,
-copy `.env.example` to `.env`, add your `OPENROUTER_API_KEY`, and set
-`CYRUS_AI_BACKEND=openrouter`. You can skip the Ollama model download when
-using OpenRouter.
+Keep Ollama running while using the local backend. For OpenRouter, CYRUS
+prompts for a key, verifies its tier, and stores the provider settings locally.
+Paid keys use a premium default model; free keys are locked to free models.
+
+After provider setup, first launch asks what name CYRUS should use for the
+current Windows user. Time-of-day greetings use the system's current local
+timezone; public holiday names come from the installed `holidays` package and
+the automatically detected Windows country/region.
+
+Date-based reminders accept ISO dates or written dates, for example:
+
+```text
+remind me on 2026-10-15 at 3:00 PM that my interview is scheduled
+remind me on 15th of October 2026 that I have an interview
+```
+
+If no time is included, the reminder is scheduled for 9:00 AM local time.
+A time-only reminder such as `set a reminder for 5:15 PM to call home` uses the
+next occurrence in the computer's local timezone. Timers and reminders remain
+separate types. A named reminder such as `set a reminder for 10 seconds named stretch`
+keeps its name when the alarm fires.
+
+When a timer or reminder is due, CYRUS displays an alert and rings without
+speaking the reminder aloud. The Windows build bundles the provided alarm
+sound. To override it for one Windows user, place a WAV file at
+`%LOCALAPPDATA%\CYRUS\reminder_alarm.wav`; if neither file is available, CYRUS
+generates a default alarm tone.
 
 ### Configure optional Alan speech
 
-CYRUS does not bundle the Alan voice files. Download both files from the
+The Windows builds and installer bundle the Alan voice files; setup does not
+offer a separate Alan download. For source runs where the assets are missing,
+download both files from the
 [upstream Alan voice folder on Hugging Face](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_GB/alan/medium):
 
 - [Download the Alan ONNX model](https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx?download=true)
@@ -134,9 +179,9 @@ CYRUS/
     └── en_GB-alan-medium.onnx.json
 ```
 
-The installer provides an optional download too. For an installed copy, save
-the files in `%LOCALAPPDATA%\CYRUS\voices\` instead, then restart CYRUS. The
-model card points to a source marked **All Rights Reserved**; review the
+The user-level directory `%LOCALAPPDATA%\CYRUS\voices\` can also hold a
+downloaded copy. The model card points to a source marked **All Rights
+Reserved**; review the
 [upstream model card and terms](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_GB/alan/medium)
 before downloading or using the voice.
 
@@ -161,15 +206,15 @@ py -3.11 -m venv .venv
 .\build_windows.ps1
 ```
 
-Build outputs:
+The build script creates a temporary runtime folder for packaging, then removes
+it after compiling the setup package. The distributable output is:
 
-- Portable folder: `dist\CYRUS\` (keep the entire folder together)
 - Installer: `dist\installer\CYRUS-Setup.exe`
 
 The installer requests administrator approval through UAC and offers a custom
 install location, optional features, and a desktop shortcut. It can optionally
-download the Ollama model and Alan voice files after installation; neither
-download is required to build the installer.
+download the Ollama model after installation; that download is not required
+to build the installer.
 
 ## 🌦️ Search, weather, and media
 
@@ -180,8 +225,11 @@ download is required to build the installer.
   `search for ...` for general web results. Search is not a guarantee of
   complete or exhaustive answers.
 - Open supported applications and websites with chat or voice commands.
-- Ask CYRUS to search YouTube for music and manage the queue. VLC must be
+- Ask CYRUS to search YouTube or open and play the first matching video in the
+  default browser. Music search and queue controls use VLC, which must be
   installed for the local player integration.
+- Explicit Google and Spotify searches open results in the default browser;
+  Spotify play requests open matching results for the user to select.
 - Set timers and reminders using natural-language requests.
 
 ## 🔊 Audio controls
@@ -196,16 +244,17 @@ volume commands remain available.
 
 ## 🔐 Privacy and network use
 
-- Typed conversations use Ollama locally by default. If OpenRouter is selected,
-  prompts and the memory context included with them are sent online.
+- Typed conversations use the selected provider. With OpenRouter, prompts and
+  the memory context included with them are sent online.
 - When enabled, microphone speech is sent to Google's online
   speech-recognition service. The microphone starts muted.
 - A screen-analysis request sends a screenshot to OpenRouter.
 - Web/news queries go to DuckDuckGo. Weather uses Open-Meteo and IP-based
   geolocation when no location is given.
-- Alan speech synthesis is local once the model files have been downloaded.
-- Personal API keys, `.env`, local memory, build outputs, and downloaded voice
-  models are excluded from Git. **Never commit credentials or personal data.**
+- Alan speech synthesis is local; packaged builds include the model files.
+- Personal API keys, local `config.json`, `.env`, memory, build outputs, and
+  downloaded voice models are excluded from Git. **Never commit credentials or
+  personal data.**
 
 Use voice and screen-analysis features with sensitive information only if
 you're comfortable with these data flows. Offline mode disables online AI,

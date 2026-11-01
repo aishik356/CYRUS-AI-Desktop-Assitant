@@ -16,6 +16,10 @@ APP_DIRECTORY = (
     else PROJECT_ROOT
 )
 CONFIG_PATH = PROJECT_ROOT / "config" / "api_keys.json"
+PORTABLE_MODE = bool(
+    getattr(sys, "frozen", False)
+    and not (APP_DIRECTORY / "features.json").is_file()
+)
 load_dotenv(APP_DIRECTORY / ".env", override=False)
 
 
@@ -44,10 +48,19 @@ def get_user_voice_dir() -> Path:
 USER_CONFIG_PATH = get_user_data_dir() / "api_keys.json"
 
 
+def get_api_settings_path() -> Path:
+    if PORTABLE_MODE:
+        return APP_DIRECTORY / "config.json"
+    return USER_CONFIG_PATH
+
+
+def has_saved_api_settings() -> bool:
+    return get_api_settings_path().is_file()
+
+
 def load_api_settings() -> dict:
-    config_path = (
-        USER_CONFIG_PATH if USER_CONFIG_PATH.exists() else CONFIG_PATH
-    )
+    saved_config_path = get_api_settings_path()
+    config_path = saved_config_path if saved_config_path.exists() else CONFIG_PATH
     if not config_path.exists():
         return {}
     with config_path.open("r", encoding="utf-8") as config_file:
@@ -55,6 +68,19 @@ def load_api_settings() -> dict:
     if not isinstance(settings, dict):
         raise ValueError(f"{config_path} must contain a JSON object.")
     return settings
+
+
+def save_api_settings(settings: dict) -> Path:
+    if not isinstance(settings, dict):
+        raise ValueError("API settings must be a JSON object.")
+    config_path = get_api_settings_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = config_path.with_suffix(config_path.suffix + ".tmp")
+    with temporary_path.open("w", encoding="utf-8") as config_file:
+        json.dump(settings, config_file, indent=2)
+        config_file.write("\n")
+    temporary_path.replace(config_path)
+    return config_path
 
 
 WAKE_WORD = "cyrus"

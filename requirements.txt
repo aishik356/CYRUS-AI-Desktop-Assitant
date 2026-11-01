@@ -15,6 +15,7 @@ python-vlc>=3.0.20123
 requests>=2.31.0
 ddgs>=9.0.0
 python-dotenv>=1.0.1
+holidays>=0.68
 
 # GUI, screen capture, and local model client
 PyQt6>=6.11.0

@@ -31,6 +31,17 @@ _NUMBER_WORDS = {
     "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
     "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
 }
+_ABSOLUTE_DATE_RE = re.compile(
+    r"\b\d{4}-\d{1,2}-\d{1,2}\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?[A-Za-z]+\s+\d{4}\b"
+    r"|\b[A-Za-z]+\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4}\b",
+    re.IGNORECASE,
+)
+_REMINDER_TIME_RE = re.compile(
+    r"\b(?:at\s+)?(?P<time>\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?)?"
+    r"|\d{1,2}\s*(?:a\.?m\.?|p\.?m\.?))\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_duration_amount(value: str) -> int | None:
@@ -64,21 +75,126 @@ def parse_reminder_command(query: str) -> tuple[int, str] | None:
     delay_seconds = amount * multiplier
     if delay_seconds < 1 or delay_seconds > 365 * 24 * 3600:
         return None
-    title = re.sub(
-        r"\b(?:(?:set|create|start|make)\s+)?(?:a\s+)?(?:timer|reminder)\b",
-        "",
-        query,
-        flags=re.IGNORECASE,
+    named_title = re.search(
+        r"\b(?:named|called)\s+(.+)$", query, flags=re.IGNORECASE
     )
-    title = _DURATION_RE.sub("", title)
-    title = re.sub(r"^\s*(?:please\s+)?(?:remind\s+me)\s*", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"^\s*(?:to|that|for)\s+", "", title, flags=re.IGNORECASE)
-    title = title.strip(" .,!?:;-")
+    if named_title:
+        title = named_title.group(1).strip(" .,!?:;-")
+    else:
+        title = re.sub(
+            r"\b(?:(?:please\s+)?(?:set|create|start|make)\s+)?"
+            r"(?:a\s+)?(?:timer|reminder)\b",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        )
+        title = _DURATION_RE.sub("", title)
+        title = re.sub(
+            r"^\s*(?:please\s+)?(?:remind\s+me)\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
+        title = re.sub(
+            r"^\s*(?:please\s+)?(?:set|create|start|make)\s*",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
+        title = re.sub(r"^\s*(?:to|that|for|named|called)\s+", "", title, flags=re.IGNORECASE)
+        title = title.strip(" .,!?:;-")
     if not title:
         title = "Reminder" if re.search(
             r"\b(?:reminder|remind\s+me)\b", query, re.IGNORECASE
         ) else "Timer"
     return delay_seconds, title
+
+
+def parse_absolute_reminder_command(
+    query: str,
+    now: datetime | None = None,
+) -> tuple[datetime, str] | None:
+    date_match = _ABSOLUTE_DATE_RE.search(query)
+    time_match = _REMINDER_TIME_RE.search(query)
+    if not date_match and not time_match:
+        return None
+
+    parsed_date = None
+    if date_match:
+        date_text = re.sub(
+            r"(?<=\d)(?:st|nd|rd|th)\b", "", date_match.group(), flags=re.IGNORECASE
+        )
+        date_text = re.sub(r"\bof\b", "", date_text, flags=re.IGNORECASE)
+        date_text = re.sub(r"\s+", " ", date_text).strip(" ,")
+        date_text = date_text.replace(",", "")
+        for date_format in (
+            "%Y-%m-%d", "%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y",
+        ):
+            try:
+                parsed_date = datetime.strptime(date_text, date_format).date()
+                break
+            except ValueError:
+                continue
+        if parsed_date is None:
+            raise ValueError(
+                f"I couldn't understand the reminder date '{date_match.group()}'."
+            )
+
+    reminder_time = None
+    if time_match:
+        time_text = re.sub(r"\s+", " ", time_match.group("time").replace(".", "").upper()).strip()
+        time_text = re.sub(r"(?<=\d)(AM|PM)$", r" \1", time_text)
+        formats = ("%I:%M %p", "%I %p", "%H:%M")
+        for time_format in formats:
+            try:
+                reminder_time = datetime.strptime(time_text, time_format).time()
+                break
+            except ValueError:
+                continue
+        if reminder_time is None:
+            raise ValueError(f"I couldn't understand the reminder time '{time_match.group('time')}'.")
+    else:
+        reminder_time = datetime.strptime("09:00", "%H:%M").time()
+
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    parsed_date = parsed_date or current.date()
+    due_at = datetime.combine(parsed_date, reminder_time, tzinfo=current.tzinfo)
+    if not date_match and due_at <= current:
+        due_at += timedelta(days=1)
+    elif date_match and due_at <= current:
+        raise ValueError("That reminder date and time has already passed.")
+
+    title = query
+    spans = []
+    if date_match:
+        spans.append((date_match.start(), date_match.end()))
+    if time_match:
+        spans.append((time_match.start(), time_match.end()))
+    for start, end in sorted(spans, reverse=True):
+        title = title[:start] + " " + title[end:]
+    title = re.sub(
+        r"^\s*(?:please\s+)?(?:set|create|make)\s+(?:a\s+)?reminder\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^\s*(?:please\s+)?(?:set|create|make)\s+(?:a\s+)?(?:timer|reminder)\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(r"^\s*(?:for|at|on|to|that)\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*(?:please\s+)?remind\s+me\s*", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*(?:on|for|to|that)\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^\s*(?:named|called)\s+", "", title, flags=re.IGNORECASE)
+    title = title.strip(" .,!?:;-")
+    title = re.sub(r"^(?:to|that|for)\s+", "", title, flags=re.IGNORECASE)
+    if not title:
+        title = "Reminder"
+    return due_at, title
 
 
 class ReminderService:
@@ -92,10 +208,21 @@ class ReminderService:
         self._reminders = self._load()
         self._thread = None
         if start:
+            self.start()
+
+    def start(self):
+        with self._lock:
+            if self._stopping:
+                raise RuntimeError("A stopped reminder service cannot be restarted.")
+            if self._thread is not None and self._thread.is_alive():
+                return
             self._thread = threading.Thread(
-                target=self._run, name="CyrusReminders", daemon=True
+                target=self._run,
+                name="CyrusReminders",
+                daemon=True,
             )
             self._thread.start()
+        self._wake.set()
 
     def _load(self) -> list[dict]:
         if not self.reminder_file.exists():
@@ -181,6 +308,42 @@ class ReminderService:
         label = "Reminder" if kind == "reminder" else "Timer"
         return f"{label} set for {delay_seconds} seconds from now: {reminder['message']} (ID {reminder['id']})."
 
+    def schedule_at(
+        self,
+        due_at: datetime,
+        message: str = "Reminder",
+        kind: str = "reminder",
+    ) -> str:
+        if not isinstance(due_at, datetime):
+            raise TypeError("due_at must be a datetime.")
+        if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        if due_at <= datetime.now(due_at.tzinfo):
+            raise ValueError("Reminder date and time must be in the future.")
+        if kind not in {"timer", "reminder"}:
+            raise ValueError("kind must be 'timer' or 'reminder'.")
+        reminder = {
+            "id": uuid.uuid4().hex[:8],
+            "due_at": due_at.isoformat(),
+            "message": message.strip()
+            or ("Timer" if kind == "timer" else "Reminder"),
+            "kind": kind,
+        }
+        with self._lock:
+            self._reminders.append(reminder)
+            if not self._save():
+                self._reminders.pop()
+                return "I couldn't save that reminder. Check local storage permissions and try again."
+        self._wake.set()
+        if self.on_change:
+            try:
+                self.on_change(self.list_reminders())
+            except Exception as error:
+                print(f"[Reminder Error]: Could not update countdown display: {error}")
+        due_label = due_at.astimezone().strftime("%B %d, %Y at %I:%M %p")
+        label = "Timer" if kind == "timer" else "Reminder"
+        return f"{label} set for {due_label}: {reminder['message']} (ID {reminder['id']})."
+
     def list_reminders(self) -> list[dict]:
         with self._lock:
             return [dict(item) for item in self._reminders]
@@ -234,7 +397,12 @@ class ReminderService:
         for reminder in due:
             if self.on_due:
                 try:
-                    self.on_due(reminder["message"])
+                    label = (
+                        "Timer"
+                        if reminder.get("kind") == "timer"
+                        else "Reminder"
+                    )
+                    self.on_due(f"{label}: {reminder['message']}")
                 except Exception as error:
                     print(f"[Reminder Error]: Could not display reminder alert: {error}")
         return due

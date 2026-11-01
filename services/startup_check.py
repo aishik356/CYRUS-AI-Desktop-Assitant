@@ -9,6 +9,7 @@ import vlc
 from core.speaker import voice_asset_paths
 from config.settings import (
     LLM_MODEL,
+    PORTABLE_MODE,
     get_user_data_dir,
     load_api_settings,
 )
@@ -124,12 +125,14 @@ def check_startup_requirements() -> list[StartupCheck]:
     if backend_value is None:
         backend_value = api_settings.get("ai_backend", "ollama")
     backend = str(backend_value).strip().lower()
+    if PORTABLE_MODE:
+        backend = "openrouter"
     offline = os.getenv("CYRUS_OFFLINE_MODE", "").strip().lower() in {
         "1",
         "true",
         "yes",
     } or bool(load_user_state().get("offline_mode", False))
-    if offline and backend == "openrouter":
+    if not PORTABLE_MODE and offline and backend == "openrouter":
         backend = "ollama"
 
     if backend == "openrouter":

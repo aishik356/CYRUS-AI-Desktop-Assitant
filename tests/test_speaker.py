@@ -60,8 +60,44 @@ class VoiceSpeakerTests(unittest.TestCase):
     def test_reports_voice_model_initialization_errors(self, load_voice):
         load_voice.side_effect = RuntimeError("model could not load")
 
-        with self.assertRaisesRegex(RuntimeError, "Piper speech engine could not start"):
-            VoiceSpeaker()
+        speaker = VoiceSpeaker()
+
+        self.assertFalse(speaker.is_available)
+        self.assertTrue(speaker._degraded)
+
+    @patch("core.speaker._load_piper_voice", return_value=MagicMock())
+    def test_cleanup_removes_tracked_temporary_speech_files(self, _load_voice):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            speech_file = Path(temporary_directory) / "temp_speech.wav"
+            speech_file.touch()
+            speaker = VoiceSpeaker()
+            speaker.track_temporary_audio_file(speech_file)
+
+            speaker.cleanup_temp_files()
+            self.assertFalse(speech_file.exists())
+            self.assertTrue(speaker.stop_requested.is_set())
+
+    @patch("core.speaker.sounddevice.RawOutputStream")
+    @patch("core.speaker._synthesize_at_full_volume")
+    @patch("core.speaker._load_piper_voice", return_value=MagicMock())
+    def test_audio_device_failure_degrades_without_raising(
+        self, _load_voice, synthesize, output_stream
+    ):
+        speaker = VoiceSpeaker()
+        speaker.on_status_change = MagicMock()
+        synthesize.return_value = [
+            SimpleNamespace(
+                audio_int16_bytes=b"\x00\x00",
+                sample_rate=22050,
+                sample_channels=1,
+            )
+        ]
+        output_stream.return_value.start.side_effect = OSError("device unavailable")
+
+        speaker.speak("Hello")
+
+        self.assertFalse(speaker.is_available)
+        speaker.on_status_change.assert_called_once_with(False)
 
     def test_empty_text_does_not_initialize_audio(self):
         speaker = VoiceSpeaker.__new__(VoiceSpeaker)

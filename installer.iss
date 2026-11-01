@@ -2,7 +2,7 @@
   #define BuildDir "dist\CYRUS"
 #endif
 
-#define AppVersion "1.0.0"
+#define AppVersion "1.1.0"
 
 [Setup]
 AppId={{B161D0D9-73EA-4A4E-909C-431B8A8B5C9B}
@@ -36,7 +36,7 @@ Name: "custom"; Description: "Custom installation"; Flags: iscustom
 
 [Components]
 Name: "core"; Description: "CYRUS assistant, dashboard, typed chat, timers, and local system tools"; Types: full custom; Flags: fixed
-Name: "alan_voice"; Description: "Alan local speech output (download the voice separately)"; Types: full
+Name: "alan_voice"; Description: "Alan local speech output (voice model bundled)"; Types: full
 Name: "microphone_input"; Description: "Microphone speech input (Google online transcription; mic starts muted)"; Types: full
 Name: "web_news"; Description: "Web search and current-news results (internet required)"; Types: full
 Name: "vlc_music"; Description: "Music search and playback (VLC must be installed separately)"; Types: full
@@ -47,12 +47,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#BuildDir}\CYRUS.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BuildDir}\_internal\*"; DestDir: "{app}\_internal"; Excludes: "voices\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#BuildDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#BuildDir}\.env.example"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\api_keys.example.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\download_ollama_model.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BuildDir}\download_alan_voice.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\CYRUS"; Filename: "{app}\CYRUS.exe"; IconFilename: "{app}\CYRUS.exe"
@@ -60,7 +59,6 @@ Name: "{autodesktop}\CYRUS"; Filename: "{app}\CYRUS.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -NoExit -File ""{app}\download_ollama_model.ps1"""; Description: "Download the local AI model llama3.2:3b (several GB; internet required)"; Flags: postinstall runasoriginaluser unchecked nowait
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\download_alan_voice.ps1"""; Description: "Download Alan Piper voice files from Hugging Face (about 63 MB)"; Flags: postinstall runasoriginaluser unchecked; Check: ShouldOfferVoiceDownload
 Filename: "{app}\CYRUS.exe"; Description: "Launch CYRUS"; Flags: postinstall nowait skipifsilent runasoriginaluser
 
 [UninstallDelete]
@@ -90,11 +88,6 @@ begin
 
   if not SaveStringToFile(ExpandConstant('{app}\features.json'), FeatureConfiguration, False) then
     RaiseException('Could not save the selected CYRUS features.');
-end;
-
-function ShouldOfferVoiceDownload: Boolean;
-begin
-  Result := WizardIsComponentSelected('alan_voice');
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

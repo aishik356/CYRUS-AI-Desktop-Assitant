@@ -190,6 +190,80 @@ class LiveOnlineToolsTests(unittest.TestCase):
             "https://www.youtube.com/results?search_query=bbs"
         )
 
+    @patch("services.system_tools.threading.Thread")
+    def test_youtube_play_command_queues_first_video_for_default_browser(self, thread_type):
+        thread = thread_type.return_value
+        thread.start.return_value = None
+        downloader = MagicMock()
+        downloader.__enter__.return_value = downloader
+        downloader.extract_info.return_value = {
+            "entries": [{"id": "abc123", "title": "BBC video"}]
+        }
+        with (
+            patch("services.system_tools.yt_dlp.YoutubeDL", return_value=downloader),
+            patch("services.system_tools.webbrowser.open", return_value=True) as open_url,
+        ):
+            handled, result = self.tools.execute_command(
+                "open YouTube and play a BBC video"
+            )
+            self.assertTrue(handled)
+            self.assertIn("Finding a YouTube video for BBC", result)
+            thread_type.assert_called_once()
+            thread_type.call_args.kwargs["target"]()
+
+        downloader.extract_info.assert_called_once_with(
+            "ytsearch1:BBC", download=False
+        )
+        open_url.assert_called_once_with(
+            "https://www.youtube.com/watch?v=abc123"
+        )
+
+    @patch("services.system_tools.webbrowser.open", return_value=True)
+    def test_spotify_play_command_opens_search_for_the_requested_song(self, open_url):
+        handled, result = self.tools.execute_command(
+            "open Spotify and play Here Comes the Sun"
+        )
+
+        self.assertTrue(handled)
+        self.assertIn("Choose a result to start playback", result)
+        open_url.assert_called_once_with(
+            "https://open.spotify.com/search/Here%20Comes%20the%20Sun"
+        )
+
+    @patch("services.system_tools.webbrowser.open", return_value=True)
+    def test_explicit_external_searches_open_the_requested_default_browser_page(
+        self, open_url
+    ):
+        cases = (
+            (
+                "search on YouTube for happy birthday",
+                "https://www.youtube.com/results?search_query=happy+birthday",
+            ),
+            (
+                "search for happy birthday on YouTube",
+                "https://www.youtube.com/results?search_query=happy+birthday",
+            ),
+            (
+                "open Google and search for local weather",
+                "https://www.google.com/search?q=local+weather",
+            ),
+            (
+                "search for local weather on Google",
+                "https://www.google.com/search?q=local+weather",
+            ),
+            (
+                "search on Spotify for happy birthday",
+                "https://open.spotify.com/search/happy%20birthday",
+            ),
+        )
+        for query, expected_url in cases:
+            with self.subTest(query=query):
+                open_url.reset_mock()
+                handled, result = self.tools.execute_command(query)
+                self.assertTrue(handled)
+                self.assertIn("Opening", result)
+                open_url.assert_called_once_with(expected_url)
+
     @patch("services.system_tools.subprocess.Popen")
     @patch("services.system_tools.shutil.which", return_value="/usr/bin/gnome-calculator")
     @patch("services.system_tools.platform.system", return_value="Linux")
@@ -378,8 +452,10 @@ class LiveOnlineToolsTests(unittest.TestCase):
             ("start a timer for 2 hours", (7200, "Timer")),
             ("set a timer for five minutes", (300, "Timer")),
             ("remind me in twenty seconds to stretch", (20, "stretch")),
+            ("set a reminder for 1 minute", (60, "Reminder")),
             ("set reminder after one hour to take a break", (3600, "take a break")),
             ("set a timer for 30 secs", (30, "Timer")),
+            ("set a reminder for 10 secs named inner", (10, "inner")),
         )
         for query, expected in cases:
             with self.subTest(query=query):
@@ -395,6 +471,50 @@ class LiveOnlineToolsTests(unittest.TestCase):
                     else "timer"
                 )
                 reminders.schedule.assert_called_once_with(*expected, kind=kind)
+
+    def test_misspelled_typed_reminder_routes_to_reminder_service(self):
+        reminders = MagicMock()
+        reminders.schedule.return_value = "Reminder set."
+        self.tools.reminders = reminders
+
+        handled, result = self.tools.execute_command(
+            "set a remnder for 1 minut"
+        )
+
+        self.assertTrue(handled)
+        self.assertEqual(result, "Reminder set.")
+        reminders.schedule.assert_called_once_with(
+            60, "Reminder", kind="reminder"
+        )
+
+    @patch("services.system_tools.webbrowser.open", return_value=True)
+    def test_misspelled_typed_youtube_search_is_understood(self, open_url):
+        handled, result = self.tools.execute_command(
+            "serch on youtub for BBS"
+        )
+
+        self.assertTrue(handled)
+        self.assertIn("YouTube search results for BBS", result)
+        open_url.assert_called_once_with(
+            "https://www.youtube.com/results?search_query=BBS"
+        )
+
+    def test_absolute_timer_and_reminder_keep_their_distinct_kinds(self):
+        for query, expected_kind in (
+            ("set a timer for 7:45", "timer"),
+            ("set a reminder for 7:45", "reminder"),
+        ):
+            with self.subTest(query=query):
+                reminders = MagicMock()
+                reminders.schedule_at.return_value = "scheduled"
+                self.tools.reminders = reminders
+                handled, result = self.tools.execute_command(query)
+                self.assertTrue(handled)
+                self.assertEqual(result, "scheduled")
+                self.assertEqual(
+                    reminders.schedule_at.call_args.kwargs["kind"],
+                    expected_kind,
+                )
 
     def test_incomplete_timer_request_is_explained_not_routed_to_specs(self):
         reminders = MagicMock()
@@ -511,7 +631,7 @@ class ReminderServiceTests(unittest.TestCase):
             ).isoformat()
             fired = service._fire_due()
             self.assertEqual(len(fired), 1)
-            self.assertEqual(alerts, ["stretch"])
+            self.assertEqual(alerts, ["Timer: stretch"])
             service.stop()
             loaded.stop()
 

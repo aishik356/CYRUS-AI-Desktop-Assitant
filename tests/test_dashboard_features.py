@@ -1,14 +1,18 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtTest import QSignalSpy, QTest
-from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
+from PyQt6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox
 
+from config.settings import PROJECT_ROOT
 from gui.dynamic_island import DynamicIslandHUD
 
 
@@ -25,6 +29,8 @@ class DashboardFeatureTests(unittest.TestCase):
     def tearDown(self):
         self.hud.telemetry_timer.stop()
         self.hud.countdown_timer.stop()
+        self.hud.alarm_timer.stop()
+        self.hud.cleanup_alarm_audio()
         self.hud.voice_volume_save_timer.stop()
         self.hud.system_volume_apply_timer.stop()
         self.hud.player_volume_apply_timer.stop()
@@ -53,7 +59,51 @@ class DashboardFeatureTests(unittest.TestCase):
         self.hud.set_mic_muted(False)
         self.assertEqual(len(spy), 1)
         self.assertEqual(spy[0][0], False)
+        self.assertEqual(self.hud.current_subtext, "MIC ON // SPEAK NOW")
+        self.assertEqual(self.hud.btn_mic.text(), "🎤 MIC ON")
         self.assertFalse(hasattr(self.hud, "diag_mic_lbl"))
+
+    def test_hotkey_mic_toggle_is_dispatched_on_the_gui_thread(self):
+        thread = threading.Thread(
+            target=self.hud.mic_toggle_requested_signal.emit
+        )
+        thread.start()
+        thread.join(timeout=1)
+        self.assertFalse(thread.is_alive())
+        QTest.qWait(20)
+
+        self.assertFalse(self.hud.is_mic_muted)
+        self.assertEqual(self.hud.current_subtext, "MIC ON // SPEAK NOW")
+
+        self.hud.mic_toggle_requested_signal.emit()
+        self.app.processEvents()
+        self.assertTrue(self.hud.is_mic_muted)
+
+    @patch(
+        "gui.dynamic_island.QMessageBox.question",
+        return_value=QMessageBox.StandardButton.Yes,
+    )
+    def test_microphone_permission_is_requested_before_unmuting(self, question):
+        self.hud.is_mic_muted = True
+        self.hud.update_mic_ui()
+
+        self.assertTrue(self.hud.prompt_microphone_permission())
+
+        question.assert_called_once()
+        self.assertFalse(self.hud.is_mic_muted)
+        self.assertEqual(self.hud.current_subtext, "MIC ON // SPEAK NOW")
+
+    @patch(
+        "gui.dynamic_island.QMessageBox.question",
+        return_value=QMessageBox.StandardButton.No,
+    )
+    def test_declined_microphone_permission_leaves_mic_muted(self, question):
+        self.hud.is_mic_muted = True
+
+        self.assertFalse(self.hud.prompt_microphone_permission())
+
+        question.assert_called_once()
+        self.assertTrue(self.hud.is_mic_muted)
 
     def test_subsystem_status_panel_is_removed(self):
         status_text = {
@@ -109,6 +159,17 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertFalse(self.hud.voice_volume_slider.isEnabled())
         self.assertIn("huggingface.co/rhasspy/piper-voices/resolve", self.hud.voice_download_help.text())
         self.assertIn("%LOCALAPPDATA%\\CYRUS\\voices", self.hud.voice_download_help.text())
+
+    def test_voice_download_help_is_hidden_while_voice_initializes(self):
+        self.hud.voice_output_status_signal.emit(True, False)
+        self.app.processEvents()
+        self.assertTrue(self.hud.voice_download_help.isVisible())
+
+        self.hud.voice_output_initializing_signal.emit(True)
+        self.app.processEvents()
+
+        self.assertFalse(self.hud.voice_download_help.isVisible())
+        self.assertFalse(self.hud.voice_volume_slider.isEnabled())
 
     def test_voice_download_links_hide_when_voice_is_available_or_not_selected(self):
         self.hud.voice_output_status_signal.emit(True, True)
@@ -204,7 +265,7 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertFalse(self.hud.system_volume_apply_timer.isActive())
         self.assertFalse(self.hud.player_volume_apply_timer.isActive())
 
-    @patch("gui.dynamic_island.winsound.MessageBeep")
+    @patch("gui.dynamic_island.winsound.PlaySound")
     def test_reminder_alert_is_visible_without_blocking_the_dashboard(self, play_alarm):
         self.hud.show_reminder_alert("Timer finished")
         self.assertEqual(len(self.hud._reminder_alerts), 1)
@@ -213,12 +274,29 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertTrue(alert.isVisible())
         self.assertTrue(self.hud.alarm_timer.isActive())
         play_alarm.assert_called_once()
+        alarm_path = Path(play_alarm.call_args.args[0])
+        self.assertTrue(alarm_path.is_file())
         alert.close()
         self.app.processEvents()
         self.assertEqual(self.hud._reminder_alerts, [])
         self.assertFalse(self.hud.alarm_timer.isActive())
+        self.assertFalse(self.hud._alarm_playing)
+        self.assertEqual(play_alarm.call_args.args[0], None)
 
-    @patch("gui.dynamic_island.winsound.MessageBeep")
+    @patch("gui.dynamic_island.getpass.getuser", return_value="Alex")
+    @patch("gui.dynamic_island.save_user_state", return_value=True)
+    @patch("gui.dynamic_island.QDialog.exec", return_value=QDialog.DialogCode.Accepted)
+    def test_first_run_profile_prompt_persists_name(self, _dialog, save, _user_name):
+        self.hud.user_preferences = {}
+
+        self.assertTrue(self.hud.prompt_user_profile_if_needed())
+
+        self.assertTrue(save.called)
+        saved = save.call_args.args[0]
+        self.assertEqual(saved["preferred_name"], "Alex")
+        self.assertTrue(saved["profile_setup_complete"])
+
+    @patch("gui.dynamic_island.winsound.PlaySound")
     def test_alarm_repeats_until_reminder_alert_is_dismissed(self, play_alarm):
         self.hud.show_reminder_alert("Stretch break")
         play_alarm.assert_called_once()
@@ -226,7 +304,7 @@ class DashboardFeatureTests(unittest.TestCase):
         timeout = QSignalSpy(self.hud.alarm_timer.timeout)
         self.hud.alarm_timer.setInterval(10)
         self.assertTrue(timeout.wait(1000), "Repeating alarm timer did not fire")
-        self.assertGreaterEqual(play_alarm.call_count, 2)
+        self.assertEqual(play_alarm.call_count, 1)
 
         self.hud._reminder_alerts[0].close()
         self.app.processEvents()
@@ -248,6 +326,47 @@ class DashboardFeatureTests(unittest.TestCase):
             self.hud.center_layout.indexOf(self.hud.countdown_panel),
             self.hud.center_layout.indexOf(self.hud.reactor),
         )
+
+    def test_one_minute_reminder_countdown_is_visible_in_pill_mode(self):
+        due_at = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+
+        self.hud.switchToPillMode()
+        self.hud.set_active_reminders(
+            [{"kind": "reminder", "message": "Call home", "due_at": due_at}]
+        )
+
+        self.assertIn("CALL HOME", self.hud.pill_status_label.text())
+        self.assertIn("01:00", self.hud.pill_status_label.text())
+        self.assertTrue(self.hud.countdown_panel.isHidden())
+
+    def test_custom_reminder_alarm_is_used_without_being_deleted(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            custom_alarm = Path(temporary_directory) / "reminder_alarm.wav"
+            custom_alarm.write_bytes(b"custom wav asset")
+
+            with patch(
+                "gui.dynamic_island.get_user_data_dir",
+                return_value=Path(temporary_directory),
+            ):
+                selected_alarm = self.hud._ensure_alarm_audio_file()
+                self.hud.cleanup_alarm_audio()
+
+            self.assertEqual(selected_alarm, custom_alarm)
+            self.assertTrue(custom_alarm.is_file())
+
+    def test_bundled_custom_alarm_is_used_when_no_user_override_exists(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            with patch(
+                "gui.dynamic_island.get_user_data_dir",
+                return_value=Path(temporary_directory),
+            ):
+                selected_alarm = self.hud._ensure_alarm_audio_file()
+
+        self.assertEqual(
+            selected_alarm,
+            PROJECT_ROOT / "assets" / "reminder_alarm.wav",
+        )
+        self.assertTrue(selected_alarm.is_file())
 
     def test_countdown_panel_hides_when_there_are_no_active_reminders(self):
         self.hud.set_active_reminders([])

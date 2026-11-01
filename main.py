@@ -6,33 +6,45 @@ import time
 import threading
 import mimetypes
 import re
+import requests
 
 # Load .env before importing assistant modules that read runtime settings.
 from config import settings as _runtime_settings
 from config.features import load_installed_features
-from core.speaker import SilentVoiceSpeaker, VoiceSpeaker, preload_piper_runtime
-
-preload_piper_runtime()
+from core.speaker import SilentVoiceSpeaker, VoiceSpeaker
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 
+from config.settings import (
+    PORTABLE_MODE,
+    has_saved_api_settings,
+    load_api_settings,
+)
+from config.user_state import load_user_state
 from core.listener import VoiceListener
 from core.brain import CyrusBrain
-from services.system_tools import SystemTools
+from services.system_tools import (
+    SystemTools,
+    configure_ollama,
+    configure_openrouter,
+)
 from gui.dynamic_island import DynamicIslandHUD
 from memory.memory_manager import add_note, load_memory
 from services.vision_service import analyze_screen
 from services.hotkey_service import HotkeyListener
 from services.startup_check import check_startup_requirements, startup_check_warnings
+from services.greetings import contextual_greeting
 
 
 class StartupCheckWorker(QObject):
     completed = pyqtSignal(object)
     failed = pyqtSignal(str)
+    status = pyqtSignal(str, str)
 
     def run(self):
         try:
+            self.status.emit("BOOTING", "CHECKING SYSTEM REQUIREMENTS...")
             checks = check_startup_requirements()
         except Exception as error:
             self.failed.emit(str(error))
@@ -40,21 +52,227 @@ class StartupCheckWorker(QObject):
         self.completed.emit(startup_check_warnings(checks))
 
 
+class StartupConfigurationWorker(QObject):
+    completed = pyqtSignal(object, bool)
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            settings = load_api_settings()
+            has_saved_settings = has_saved_api_settings()
+        except (OSError, ValueError) as error:
+            self.failed.emit(str(error))
+            return
+        self.completed.emit(settings, has_saved_settings)
+
+
+class ProviderSetupWorker(QObject):
+    completed = pyqtSignal(str)
+    failed = pyqtSignal(str, str, bool)
+    status = pyqtSignal(str, str)
+
+    def __init__(self, provider: str, api_key: str = ""):
+        super().__init__()
+        self.provider = provider
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            self.status.emit("BOOTING", f"VERIFYING {self.provider.upper()}...")
+            if self.provider == "openrouter":
+                settings = configure_openrouter(self.api_key)
+                os.environ["CYRUS_AI_BACKEND"] = "openrouter"
+                os.environ["OPENROUTER_API_KEY"] = settings["openrouter_api_key"]
+                os.environ["OPENROUTER_CHAT_MODEL"] = settings[
+                    "openrouter_chat_model"
+                ]
+            elif self.provider == "ollama":
+                settings = configure_ollama()
+                os.environ["CYRUS_AI_BACKEND"] = "ollama"
+                os.environ["OLLAMA_HOST"] = settings["ollama_host"]
+            else:
+                raise ValueError(f"Unsupported AI provider: {self.provider}")
+        except Exception as error:
+            self.api_key = ""
+            status_code = getattr(error.response, "status_code", None)
+            is_network_error = isinstance(error, requests.RequestException) and (
+                not isinstance(error, requests.HTTPError)
+                or status_code is None
+                or status_code >= 500
+            )
+            self.failed.emit(self.provider, str(error), is_network_error)
+            return
+        self.api_key = ""
+        self.completed.emit(self.provider)
+
+
+class StartupCoordinator(QObject):
+    def __init__(self, hud: DynamicIslandHUD, on_ready):
+        super().__init__(hud)
+        self.hud = hud
+        self.on_ready = on_ready
+        self._threads = []
+        self._workers = []
+
+    @pyqtSlot()
+    def start(self):
+        self.hud.set_state("BOOTING", "LOADING LOCAL CONFIGURATION...")
+        worker = StartupConfigurationWorker()
+        worker.completed.connect(self._on_configuration_ready)
+        worker.failed.connect(self._on_configuration_failed)
+        thread = threading.Thread(
+            target=worker.run,
+            name="CyrusStartupConfiguration",
+            daemon=True,
+        )
+        self._workers.append(worker)
+        self._threads.append(thread)
+        thread.start()
+
+    @pyqtSlot(str)
+    def _on_configuration_failed(self, message: str):
+        QMessageBox.critical(
+            self.hud,
+            "CYRUS Configuration Error",
+            f"Could not load the AI configuration: {message}",
+        )
+        QApplication.quit()
+
+    @pyqtSlot(object, bool)
+    def _on_configuration_ready(self, settings, has_saved_settings: bool):
+        if not PORTABLE_MODE and not has_saved_settings:
+            self._select_provider()
+            return
+
+        if PORTABLE_MODE:
+            provider = "openrouter"
+        else:
+            provider = os.getenv(
+                "CYRUS_AI_BACKEND",
+                str(settings.get("ai_backend", "ollama") or "ollama"),
+            ).strip().lower()
+
+        if provider == "openrouter":
+            api_key = (
+                os.getenv("OPENROUTER_API_KEY", "").strip()
+                or str(settings.get("openrouter_api_key", "") or "").strip()
+            )
+            if api_key:
+                self._start_provider_setup(provider, api_key)
+            else:
+                self._request_api_key()
+            return
+        if provider == "ollama":
+            self._start_provider_setup(provider)
+            return
+        self._select_provider()
+
+    def _select_provider(self):
+        provider = self.hud.prompt_ai_provider(PORTABLE_MODE)
+        if provider == "openrouter":
+            self._request_api_key()
+        elif provider == "ollama":
+            self._start_provider_setup(provider)
+        else:
+            QApplication.quit()
+
+    def _request_api_key(self):
+        api_key = self.hud.prompt_openrouter_api_key()
+        if api_key:
+            self._start_provider_setup("openrouter", api_key)
+        else:
+            QApplication.quit()
+
+    def _start_provider_setup(self, provider: str, api_key: str = ""):
+        worker = ProviderSetupWorker(provider, api_key)
+        worker.completed.connect(self._on_provider_ready)
+        worker.failed.connect(self._on_provider_failed)
+        worker.status.connect(self.hud.set_state)
+        thread = threading.Thread(
+            target=worker.run,
+            name="CyrusProviderSetup",
+            daemon=True,
+        )
+        self._workers.append(worker)
+        self._threads.append(thread)
+        self.hud.set_state("BOOTING", "VERIFYING AI PROVIDER...")
+        thread.start()
+
+    @pyqtSlot(str)
+    def _on_provider_ready(self, provider: str):
+        if provider == "openrouter":
+            self.hud.set_state(
+                "BOOTING", "OPENROUTER KEY SUCCESSFUL // BOOTING..."
+            )
+            self.hud.append_log(
+                "[OPENROUTER]: API key verified successfully. Booting CYRUS..."
+            )
+        if not self.hud.prompt_user_profile_if_needed():
+            QApplication.quit()
+            return
+        self.hud.prompt_microphone_permission()
+        self.on_ready()
+
+    @pyqtSlot(str, str, bool)
+    def _on_provider_failed(self, provider: str, message: str, offline: bool):
+        if offline:
+            self.hud.set_offline_mode(True)
+            self.hud.set_state("OFFLINE", "ENDPOINT UNREACHABLE // LOCAL MODE")
+            self.hud.append_log(
+                f"[OFFLINE] {provider.title()} endpoint unreachable: {message}. "
+                "Continuing with local features."
+            )
+            if not self.hud.prompt_user_profile_if_needed():
+                QApplication.quit()
+                return
+            self.hud.prompt_microphone_permission()
+            self.on_ready()
+            return
+        QMessageBox.warning(
+            self.hud,
+            "CYRUS Provider Setup",
+            f"Could not configure {provider}: {message}",
+        )
+        if provider == "openrouter":
+            self._request_api_key()
+        else:
+            self._select_provider()
+
+
 class StartupCheckNotifier(QObject):
+    finished = pyqtSignal()
+
+    def __init__(self, app, hud: DynamicIslandHUD):
+        super().__init__(app)
+        self.hud = hud
+
     @pyqtSlot(object)
     def show_warnings(self, warnings):
-        if not warnings:
-            return
-        warning_dialog = QMessageBox(
-            QMessageBox.Icon.Warning,
-            "CYRUS Setup Check",
-            "Some features may not be ready. CYRUS will still open.",
-        )
-        warning_dialog.setDetailedText(
-            "\n".join(f"{check.name}: {check.details}" for check in warnings)
-        )
-        warning_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
-        warning_dialog.exec()
+        if warnings:
+            endpoint_unreachable = any(
+                check.name == "AI backend"
+                and not check.ready
+                and "Could not reach Ollama" in check.details
+                for check in warnings
+            )
+            if endpoint_unreachable:
+                self.hud.set_offline_mode(True)
+                self.hud.set_state(
+                    "OFFLINE", "ENDPOINT UNREACHABLE // LOCAL MODE"
+                )
+                self.hud.append_log(
+                    "[OFFLINE] Ollama endpoint unreachable. "
+                    "Continuing with local features."
+                )
+            for check in warnings:
+                self.hud.append_log(
+                    f"[STARTUP WARNING] {check.name}: {check.details}"
+                )
+        if not any(
+            check.name == "AI backend" and not check.ready for check in warnings
+        ):
+            self.hud.set_state("BOOTING", "INITIALIZING CYRUS CORE...")
+        self.finished.emit()
 
     @pyqtSlot(str)
     def show_check_error(self, message):
@@ -63,6 +281,69 @@ class StartupCheckNotifier(QObject):
             "CYRUS Setup Check",
             f"Could not complete the setup check: {message}\nCYRUS will still open.",
         )
+        self.finished.emit()
+
+
+class FileInspectionWorker(QObject):
+    completed = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        file_name = os.path.basename(self.file_path)
+        try:
+            if not os.path.isfile(self.file_path):
+                raise FileNotFoundError(f"File no longer exists: {self.file_path}")
+            file_size_kb = round(os.path.getsize(self.file_path) / 1024, 2)
+            mime_type, _ = mimetypes.guess_type(self.file_path)
+            mime_type = mime_type or "Unknown/Binary"
+            ext = os.path.splitext(file_name)[1].lower() or "No Extension"
+            summary = (
+                f"File: {file_name}\nType: {mime_type} ({ext})\n"
+                f"Size: {file_size_kb} KB\n"
+            )
+            text_extensions = {
+                ".txt", ".py", ".js", ".json", ".html", ".css", ".md",
+                ".log", ".csv", ".cpp", ".c", ".sh",
+            }
+            if ext in text_extensions or "text" in mime_type:
+                with open(
+                    self.file_path, "r", encoding="utf-8", errors="ignore"
+                ) as file:
+                    summary += f"\nPreview:\n{file.read(500)}..."
+            else:
+                summary += "\nBinary structure detected."
+            spoken_text = (
+                f"File {file_name} loaded. Format is {mime_type}, "
+                f"size {file_size_kb} kilobytes."
+            )
+        except (OSError, ValueError) as error:
+            self.failed.emit(file_name, str(error))
+            return
+        self.completed.emit(summary, spoken_text)
+
+
+class FileInspectionNotifier(QObject):
+    def __init__(self, hud: DynamicIslandHUD, request_queue: Queue):
+        super().__init__(hud)
+        self.hud = hud
+        self.request_queue = request_queue
+
+    @pyqtSlot(str, str)
+    def show_result(self, summary: str, spoken_text: str):
+        self.hud.append_log(f"[FILE_INSPECTOR]:\n{summary}")
+        self.request_queue.put(("speak", spoken_text))
+        self.hud.set_state("IDLE")
+
+    @pyqtSlot(str, str)
+    def show_error(self, file_name: str, message: str):
+        self.hud.append_log(
+            f"[FILE_INSPECTOR ERROR]: Could not inspect {file_name}: {message}"
+        )
+        self.hud.set_state("IDLE")
 
 
 def speak_with_barge_in(
@@ -120,8 +401,24 @@ def process_query(
     print(f"[{source}]: {query}")
 
     greeting = clean_q.strip(" .,!?:;")
-    if greeting in {"hello", "hello cyrus", "hi", "hi cyrus", "hey", "hey cyrus"}:
-        reply = "Hello! How can I help?"
+    if greeting in {
+        "hello",
+        "hello cyrus",
+        "hi",
+        "hi cyrus",
+        "hey",
+        "hey cyrus",
+        "yo",
+        "yo cyrus",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good night",
+    }:
+        profile = load_user_state()
+        reply = contextual_greeting(
+            str(profile.get("preferred_name", "")),
+        )
         hud.append_log(f"[CYRUS]: {reply}")
         speak_with_barge_in(reply, speaker, listener, hud)
         return reply
@@ -136,7 +433,12 @@ def process_query(
 
     if any(w in clean_q for w in ["wake up cyrus", "wake up", "cyrus wake up", "cyrus online"]):
         hud.set_state("SPEAKING", "CYRUS AWAKE")
-        reply = "Online and listening, sir."
+        preferred_name = str(load_user_state().get("preferred_name", "")).strip()
+        reply = (
+            f"Online and listening, {preferred_name}."
+            if preferred_name
+            else "Online and listening."
+        )
         hud.append_log(f"[CYRUS]: {reply}")
         speaker.speak(reply)
         hud.set_state("IDLE")
@@ -217,8 +519,14 @@ def process_query(
             return reply
         if system_result == "SHUTDOWN_CYRUS":
             hud.set_state("SPEAKING", "TERMINATING CORE")
-            speaker.speak("Powering down completely. Goodbye, sir.")
-            os._exit(0)
+            preferred_name = str(load_user_state().get("preferred_name", "")).strip()
+            goodbye = (
+                f"Powering down completely. Goodbye, {preferred_name}."
+                if preferred_name
+                else "Powering down completely. Goodbye."
+            )
+            shutdown_cyrus_after_goodbye(speaker, hud, goodbye)
+            return goodbye
 
         # If it's raw web search data, pass it to the brain for a natural 2-sentence voice summary
         if system_result.startswith("Search results for"):
@@ -251,6 +559,32 @@ def process_query(
     return reply
 
 
+def shutdown_cyrus_after_goodbye(speaker, hud, goodbye: str):
+    speech_finished = threading.Event()
+
+    def speak_goodbye():
+        try:
+            speaker.speak(goodbye)
+        finally:
+            speech_finished.set()
+
+    def finish_shutdown():
+        if not speech_finished.wait(timeout=5):
+            speaker.stop()
+        hud.shutdown_signal.emit()
+
+    threading.Thread(
+        target=speak_goodbye,
+        name="CyrusShutdownSpeech",
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=finish_shutdown,
+        name="CyrusShutdownTimeout",
+        daemon=True,
+    ).start()
+
+
 def _sync_external_system_volume(hud, tools, previous_volume: int) -> int:
     current_volume = tools.get_system_master_volume(log_errors=False)
     if current_volume is None or current_volume == previous_volume:
@@ -260,14 +594,12 @@ def _sync_external_system_volume(hud, tools, previous_volume: int) -> int:
 
 
 def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
+    hud.set_state("BOOTING", "INITIALIZING VOICE AND AI SERVICES...")
     features = load_installed_features()
     microphone_input_enabled = features["microphone_input"]
-    hud.voice_output_status_signal.emit(
-        features["alan_voice"],
-        features["alan_voice"],
-    )
-    hud.set_microphone_input_enabled(microphone_input_enabled)
-    speaker = None
+    hud.voice_output_initializing_signal.emit(features["alan_voice"])
+    hud.microphone_input_status_signal.emit(microphone_input_enabled)
+    speaker = SilentVoiceSpeaker()
     listener = None
     brain = None
     tools = None
@@ -275,15 +607,19 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
     def load_speaker():
         nonlocal speaker
         if not features["alan_voice"]:
-            speaker = SilentVoiceSpeaker()
+            request_queue.put(("speaker_ready", SilentVoiceSpeaker()))
             return
         try:
-            speaker = VoiceSpeaker()
-            hud.voice_output_status_signal.emit(True, True)
+            loaded_speaker = VoiceSpeaker()
+            loaded_speaker.on_status_change = lambda available: (
+                hud.voice_output_status_signal.emit(True, available)
+            )
+            hud.voice_output_status_signal.emit(True, loaded_speaker.is_available)
         except Exception as error:
             print(f"[Error Loading Speaker]: {error}")
             hud.voice_output_status_signal.emit(True, False)
-            speaker = SilentVoiceSpeaker()
+            loaded_speaker = SilentVoiceSpeaker()
+        request_queue.put(("speaker_ready", loaded_speaker))
 
     def load_listener():
         nonlocal listener
@@ -308,23 +644,57 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
         t_lis.start()
     t_brn.start()
 
-    t_spk.join()
     if microphone_input_enabled:
         t_lis.join()
     t_brn.join()
 
-    if not speaker or (microphone_input_enabled and not listener) or not brain or not tools:
+    if not brain or not tools:
         print("[System Failure] Core subsystems failed to initialize.")
         hud.set_state("BOOTING", "INIT FAILURE")
         return
 
+    def mark_backend_offline(error):
+        hud.set_offline_mode(True)
+        tools.set_offline_mode(True)
+        if listener is not None:
+            listener.set_offline_mode(True)
+        hud.set_state("OFFLINE", "ENDPOINT UNREACHABLE // LOCAL MODE")
+        hud.append_log(
+            f"[OFFLINE] AI endpoint unreachable: {error}. "
+            "Online features are disabled; local commands remain available."
+        )
+
+    brain.on_network_error = mark_backend_offline
+    tools.on_network_error = mark_backend_offline
+
+    if microphone_input_enabled and not listener:
+        print("[TTS_WARNING]: Microphone listener failed to start — running without voice input.")
+    if listener is not None:
+        def report_microphone_status(message):
+            hud.append_log(f"[MICROPHONE]: {message}")
+            if message.startswith("Microphone unavailable"):
+                hud.set_state("ERROR", "MICROPHONE UNAVAILABLE")
+        listener.on_status_change = report_microphone_status
+
     tools.player.on_state_change = hud.set_music_state
-    tools.reminders.on_due = hud.reminder_alert_signal.emit
+    tools.player.on_error = lambda message: hud.append_log(
+        f"[MUSIC ERROR]: {message}"
+    )
+    tools.on_external_action_error = lambda message: hud.append_log(
+        f"[BROWSER ACTION ERROR]: {message}"
+    )
+    def on_reminder_due(message: str):
+        hud.reminder_alert_signal.emit(message)
+
+    tools.reminders.on_due = on_reminder_due
     tools.reminders.on_change = hud.reminders_changed_signal.emit
+    tools.reminders.start()
     hud.reminders_changed_signal.emit(tools.reminders.list_reminders())
+    app = QApplication.instance()
+    if app is not None:
+        app.aboutToQuit.connect(tools.reminders.stop)
     if listener is not None:
         listener.set_offline_mode(tools.is_offline)
-    speaker.set_volume(hud.voice_volume_slider.value())
     player_volume = hud.player_volume_slider.value()
     tools.player.set_volume(player_volume)
     system_volume = tools.get_system_master_volume()
@@ -340,28 +710,67 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
     # Link GUI Physical Mic Button to VoiceListener mute state
     if listener is not None:
         hud.mic_toggled_signal.connect(listener.set_muted)
-    hud.voice_volume_changed_signal.connect(
-        speaker.set_volume, Qt.ConnectionType.DirectConnection
-    )
     hud.offline_mode_signal.connect(tools.set_offline_mode)
     if listener is not None:
         hud.offline_mode_signal.connect(listener.set_offline_mode)
-    hud.stop_speech_signal.connect(speaker.stop)
     if listener is not None:
         listener.set_muted(hud.is_mic_muted)
 
+    def announce_online():
+        profile = load_user_state()
+        welcome_msg = contextual_greeting(
+            str(profile.get("preferred_name", "")),
+        )
+        welcome_msg = welcome_msg.removesuffix(" How can I help?")
+        welcome_msg = f"{welcome_msg} CYRUS online and standing by."
+        hud.append_log(f"[CYRUS]: {welcome_msg}")
+        hud.set_state("SPEAKING", "CYRUS ONLINE")
+        def speak_welcome():
+            speaker.speak(welcome_msg)
+            hud.set_state(
+                "MUTED" if hud.is_mic_muted else "IDLE",
+                "MIC OFF // CHAT READY" if hud.is_mic_muted else "STANDBY",
+            )
+        threading.Thread(
+            target=speak_welcome,
+            name="CyrusWelcomeSpeech",
+            daemon=True,
+        ).start()
+
+    def install_speaker(loaded_speaker):
+        nonlocal speaker
+        speaker = loaded_speaker
+        speaker.set_volume(hud.voice_volume_slider.value())
+        hud.voice_volume_changed_signal.connect(
+            speaker.set_volume, Qt.ConnectionType.DirectConnection
+        )
+        hud.stop_speech_signal.connect(speaker.stop)
+        app = QApplication.instance()
+        cleanup = getattr(speaker, "cleanup_temp_files", None)
+        if app is not None and cleanup is not None:
+            app.aboutToQuit.connect(cleanup)
+        if not getattr(install_speaker, "announced", False):
+            install_speaker.announced = True
+            announce_online()
+
+    install_speaker.announced = False
+    if not features["alan_voice"]:
+        speaker = SilentVoiceSpeaker()
+        install_speaker(speaker)
+    else:
+        hud.set_state(
+            "MUTED" if hud.is_mic_muted else "IDLE",
+            "MIC OFF // CHAT READY" if hud.is_mic_muted else "STANDBY",
+        )
+
     # --- Initialize Global Hotkey Hook (F4/Ctrl+Space=Stop Speech, F3/Ctrl+M=Mic Toggle) ---
     hotkey_hook = HotkeyListener(
-        on_mute_callback=speaker.stop,
-        on_toggle_callback=hud.toggle_mic if listener is not None else None
+        on_mute_callback=lambda: speaker.stop(),
+        on_toggle_callback=(
+            hud.mic_toggle_requested_signal.emit if listener is not None else None
+        ),
     )
     hotkey_hook.start()
-
-    welcome_msg = "At your service, sir. Cyrus online and standing by."
-    hud.append_log(f"[CYRUS]: {welcome_msg}")
-    hud.set_state("SPEAKING", "CYRUS ONLINE")
-    speaker.speak(welcome_msg)
-    hud.set_state("IDLE")
 
     is_sleeping = False
 
@@ -385,6 +794,9 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
                 hud.set_state("SPEAKING", "FILE INSPECTED")
                 speaker.speak(payload)
                 hud.set_state("IDLE")
+                continue
+            if request_type == "speaker_ready":
+                install_speaker(payload)
                 continue
             if request_type == "music_control":
                 controls = {
@@ -412,8 +824,11 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
                 result = tools.confirm_action(payload)
                 hud.append_log(f"[ACTION]: {result}")
                 if result == "CONFIRMED_SHUTDOWN_CYRUS":
-                    speaker.speak("Powering down completely. Goodbye.")
-                    os._exit(0)
+                    shutdown_cyrus_after_goodbye(
+                        speaker,
+                        hud,
+                        "Powering down completely. Goodbye.",
+                    )
                 continue
 
             current_time = time.monotonic()
@@ -435,7 +850,7 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
                 continue
 
             if not is_sleeping:
-                hud.set_state("IDLE")
+                hud.set_state("LISTENING", "MIC ON // SPEAK NOW")
 
             # 1.0s timeout ensures responsive mic mute checking without hanging
             audio = listener.listen_and_record(timeout=1.0, phrase_time_limit=10.0)
@@ -446,9 +861,10 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
             query = listener.transcribe(audio)
 
             if not query or len(query.strip()) < 2:
-                hud.set_state("IDLE")
+                hud.set_state("LISTENING", "MIC ON // SPEAK NOW")
                 continue
 
+            hud.append_log(f"[VOICE INPUT]: {query}")
             # Process voice query through unified handler
             action = process_query(query, speaker, listener, brain, tools, hud, source="VOICE")
             if action == "SLEEP":
@@ -464,52 +880,27 @@ def assistant_worker(hud: DynamicIslandHUD, request_queue: Queue):
 def main():
     app = QApplication(sys.argv)
     hud = DynamicIslandHUD()
+    hud.shutdown_signal.connect(app.quit)
     hud.show()
 
-    startup_check_notifier = StartupCheckNotifier(app)
-    startup_check_worker = StartupCheckWorker()
-    startup_check_worker.completed.connect(startup_check_notifier.show_warnings)
-    startup_check_worker.failed.connect(startup_check_notifier.show_check_error)
-    threading.Thread(
-        target=startup_check_worker.run,
-        name="CyrusStartupChecks",
-        daemon=True,
-    ).start()
+    request_queue = Queue()
 
-    # Wire up universal file inspection signal
+    file_inspection_notifier = FileInspectionNotifier(hud, request_queue)
+
+    # Keep metadata and preview reads off the GUI thread.
     def on_file_inspected(file_path):
-        if not os.path.exists(file_path):
-            return
-
         hud.set_state("THINKING", f"INSPECTING {os.path.basename(file_path)}")
-        
-        file_name = os.path.basename(file_path)
-        file_size_kb = round(os.path.getsize(file_path) / 1024, 2)
-        mime_type, _ = mimetypes.guess_type(file_path)
-        mime_type = mime_type or "Unknown/Binary"
-        ext = os.path.splitext(file_name)[1].lower() or "No Extension"
-
-        summary = f"File: {file_name}\nType: {mime_type} ({ext})\nSize: {file_size_kb} KB\n"
-
-        text_extensions = ['.txt', '.py', '.js', '.json', '.html', '.css', '.md', '.log', '.csv', '.cpp', '.c', '.sh']
-        if ext in text_extensions or "text" in mime_type:
-            try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read(500)
-                    summary += f"\nPreview:\n{content}..."
-            except Exception as e:
-                summary += f"\nError reading preview: {e}"
-        else:
-            summary += "\nBinary structure detected."
-
-        hud.append_log(f"[FILE_INSPECTOR]:\n{summary}")
-        
-        spoken_text = f"File {file_name} loaded. Format is {mime_type}, size {file_size_kb} kilobytes."
-        request_queue.put(("speak", spoken_text))
+        worker = FileInspectionWorker(file_path)
+        worker.completed.connect(file_inspection_notifier.show_result)
+        worker.failed.connect(file_inspection_notifier.show_error)
+        threading.Thread(
+            target=worker.run,
+            name="CyrusFileInspection",
+            daemon=True,
+        ).start()
 
     hud.file_inspected_signal.connect(on_file_inspected)
 
-    request_queue = Queue()
     hud.text_command_signal.connect(
         lambda query: request_queue.put(("chat", query))
     )
@@ -526,10 +917,36 @@ def main():
         lambda action: request_queue.put(("confirmed_action", action))
     )
 
-    worker = threading.Thread(
-        target=assistant_worker, args=(hud, request_queue), daemon=True
-    )
-    worker.start()
+    def start_runtime():
+        startup_check_notifier = StartupCheckNotifier(app, hud)
+        startup_check_worker = StartupCheckWorker()
+        startup_check_worker.completed.connect(
+            startup_check_notifier.show_warnings
+        )
+        startup_check_worker.failed.connect(
+            startup_check_notifier.show_check_error
+        )
+
+        def start_assistant():
+            threading.Thread(
+                target=assistant_worker,
+                args=(hud, request_queue),
+                name="CyrusAssistant",
+                daemon=True,
+            ).start()
+
+        startup_check_notifier.finished.connect(start_assistant)
+        hud.set_state("BOOTING", "CHECKING SYSTEM REQUIREMENTS...")
+        startup_check_worker.status.connect(hud.set_state)
+        startup_thread = threading.Thread(
+            target=startup_check_worker.run,
+            name="CyrusStartupChecks",
+            daemon=True,
+        )
+        startup_thread.start()
+
+    startup_coordinator = StartupCoordinator(hud, start_runtime)
+    QTimer.singleShot(0, startup_coordinator.start)
 
     sys.exit(app.exec())
 
