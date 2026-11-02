@@ -279,8 +279,6 @@ Bug reports and suggestions are welcome through
 Please don't include API keys, personal memory, or sensitive screenshots in
 issues.
 
-## 📄 License and third-party assets
+## License
 
-No project license has been specified yet; all rights are reserved by default.
-The optional Alan voice has separate upstream terms. Review the licenses of
-third-party dependencies and assets before redistribution.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
